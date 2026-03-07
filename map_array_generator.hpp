@@ -7,6 +7,7 @@
 
 struct Room {
   int x, y, w, h;
+  int room_type;
 
   int center_x() const { return x + w / 2; }
   int center_y() const { return y + h / 2; }
@@ -53,6 +54,13 @@ public:
     }
   }
 
+  int get_size() const { return N; }
+
+  Room *rooms;
+  int room_count;
+
+  int **get_matrix() { return matrix; }
+
 protected:
   int N;
   int **matrix;
@@ -72,9 +80,15 @@ protected:
       return false;
     }
 
-    for (int row = room.y; row < room.y + room.h; row++) {
-      for (int col = room.x; col < room.x + room.w; col++) {
-        if (matrix[row][col] == 1) {
+    // Revisar el área de la sala + 1 celda de margen en cada dirección
+    int start_row = (room.y - 1 > 0) ? room.y - 1 : 0;
+    int end_row = (room.y + room.h + 1 < N) ? room.y + room.h + 1 : N;
+    int start_col = (room.x - 1 > 0) ? room.x - 1 : 0;
+    int end_col = (room.x + room.w + 1 < N) ? room.x + room.w + 1 : N;
+
+    for (int row = start_row; row < end_row; row++) {
+      for (int col = start_col; col < end_col; col++) {
+        if (matrix[row][col] != 0) {
           return false;
         }
       }
@@ -82,11 +96,11 @@ protected:
     return true;
   }
 
-  // Esculpe una sala en el mapa (pone 1 en el área de la sala)
+  // Esculpe una sala en el mapa (pone el room_type en el área de la sala)
   void carve_room(const Room &room) {
     for (int row = room.y; row < room.y + room.h; row++) {
       for (int col = room.x; col < room.x + room.w; col++) {
-        matrix[row][col] = 1;
+        matrix[row][col] = room.room_type;
       }
     }
   }
@@ -123,8 +137,8 @@ protected:
   }
 
   void generate_map() {
-    Room rooms[MAX_ROOM_ATTEMPTS];
-    int room_count = 0;
+    rooms = new Room[MAX_ROOM_ATTEMPTS];
+    room_count = 0;
 
     for (int attempt = 0; attempt < MAX_ROOM_ATTEMPTS; attempt++) {
       int w = rand_range(ROOM_MIN_SIZE, ROOM_MAX_SIZE);
@@ -138,7 +152,8 @@ protected:
       int x = rand_range(1, N - w - 1);
       int y = rand_range(1, N - h - 1);
 
-      Room new_room = {x, y, w, h};
+      int type = rand_range(1, 5);
+      Room new_room = {x, y, w, h, type};
 
       if (!can_place_room(new_room)) {
         continue;
