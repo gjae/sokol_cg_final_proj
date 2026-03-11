@@ -26,9 +26,12 @@ static InputState g_input = {};
 
 // Recursos de Sokol
 static Mesh g_wall_mesh;
+static Mesh g_floor_mesh;
 static sg_pipeline g_pip;
 static sg_buffer g_inst_buf;
+static sg_buffer g_floor_inst_buf;
 static int g_num_instances = 0;
+static int g_num_floor_instances = 0;
 static sg_sampler g_sampler;
 
 // Callback: se ejecuta una vez al iniciar la aplicación
@@ -57,8 +60,18 @@ static void init_cb(void) {
          g_config.levels[0].level, g_config.levels[0].map->get_size(),
          g_config.levels[0].map->get_size(), g_config.collectable_count[0]);
 
-  // Posicionar la cámara en un pasillo o sala base (por ahora centro del mapa)
-  g_camera.position = HMM_V3(5.0f, 1.0f, 5.0f);
+  // Posicionar la cámara en una sala aleatoria
+  if (g_config.levels[0].map->room_count > 0) {
+    int start_room_idx = rand() % g_config.levels[0].map->room_count;
+    printf("Sala inicial: %d\n", start_room_idx);
+    Room start_room = g_config.levels[0].map->rooms[start_room_idx];
+    float cw = 2.0f; // Tamaño aproximado de la celda en 3D
+    g_camera.position =
+        HMM_V3(start_room.center_y() * cw, 1.0f, start_room.center_x() * cw);
+  } else {
+    // Fallback si no hay salas (muy poco probable)
+    g_camera.position = HMM_V3(5.0f, 1.0f, 5.0f);
+  }
   g_camera.update_vectors();
 
   sapp_lock_mouse(true);
@@ -67,11 +80,23 @@ static void init_cb(void) {
   std::string obj_path = "assets/scifi/OBJ/Walls/WallAstra_Straight.obj";
   std::string tex_path = "assets/scifi/Textures/T_Trim_01_BaseColor.png";
   if (!load_obj(obj_path, tex_path, g_wall_mesh)) {
-    printf("Error cargando %s\n", obj_path.c_str());
+    printf("Error cargando pared %s\n", obj_path.c_str());
   }
 
-  // Generar instancias de la pared según el mapa
+  // Cargar modelo 3D del suelo
+  std::string floor_obj_path =
+      "assets/scifi/OBJ/Platforms/Platform_DarkPlates.obj";
+  std::string floor_tex_path =
+      "assets/scifi/Textures/T_Trim_01_BaseColor.png"; // Usando un trim
+                                                       // genérico si no hay uno
+                                                       // específico
+  if (!load_obj(floor_obj_path, floor_tex_path, g_floor_mesh)) {
+    printf("Error cargando suelo %s\n", floor_obj_path.c_str());
+  }
+
+  // Generar instancias de la pared y suelo según el mapa
   std::vector<HMM_Mat4> instances;
+  std::vector<HMM_Mat4> floor_instances;
   int **matrix = g_config.levels[0].map->get_matrix();
   int size = g_config.levels[0].map->get_size();
 
@@ -81,21 +106,39 @@ static void init_cb(void) {
   for (int z = 0; z < size; z++) {
     for (int x = 0; x < size; x++) {
       if (matrix[z][x] == 0) { // 0 es pared
-        // Creamos la matriz de transformacion (solo translacion por ahora)
-        HMM_Mat4 model =
-            HMM_Translate(HMM_V3(x * cw, 0.0f, z * cw)); // Paredes en Y=0
+        // Nueva orientación: Z (2D) representa X en el mapa 3D (yendo hacia -X)
+        // X (2D) representa Z en el mapa 3D
+        HMM_Mat4 model = HMM_Translate(HMM_V3(-z * cw, 0.0f, x * cw));
         instances.push_back(model);
+      } else if (matrix[z][x] == 1) { // 1 es pasillo o sala
+        // El suelo se construye con 2 baldosas por celda para cubrirla.
+        // Asumiendo que cw es 2.0f, cada baldosa mide ~1x2 o similar.
+        // Posicionamos 2 mitades. Haremos 2 baldosas adyacentes a nivel Y =
+        // -0.05f
+        HMM_Mat4 f_model1 =
+            HMM_Translate(HMM_V3(-z * cw - 0.5f, -0.05f, x * cw));
+        HMM_Mat4 f_model2 =
+            HMM_Translate(HMM_V3(-z * cw + 0.5f, -0.05f, x * cw));
+        floor_instances.push_back(f_model1);
+        floor_instances.push_back(f_model2);
       }
     }
   }
 
   g_num_instances = (int)instances.size();
+  g_num_floor_instances = (int)floor_instances.size();
 
-  // Buffer de instanciación
+  // Buffer de instanciación para paredes
   sg_buffer_desc inst_desc = {};
   inst_desc.usage.vertex_buffer = true;
   inst_desc.data = SG_RANGE(instances);
   g_inst_buf = sg_make_buffer(&inst_desc);
+
+  // Buffer de instanciación para el suelo
+  sg_buffer_desc floor_inst_desc = {};
+  floor_inst_desc.usage.vertex_buffer = true;
+  floor_inst_desc.data = SG_RANGE(floor_instances);
+  g_floor_inst_buf = sg_make_buffer(&floor_inst_desc);
 
   // Crear Sampler genérico
   sg_sampler_desc smp_desc = {};
@@ -204,7 +247,28 @@ static void frame_cb(void) {
     sg_range params_range = SG_RANGE(vs_params);
     sg_apply_uniforms(0, &params_range);
 
+    // Draw walls
     sg_draw(0, g_wall_mesh.num_indices, g_num_instances);
+  }
+
+  // Draw floors
+  if (g_floor_mesh.num_indices > 0 &&
+      g_floor_mesh.diffuse_img.id != SG_INVALID_ID) {
+    // Reutilizamos el mismo pipeline estático pero cambiamos los bindings
+    sg_apply_pipeline(g_pip);
+    sg_bindings f_binds = {};
+    f_binds.vertex_buffers[0] = g_floor_mesh.vbuf;
+    f_binds.vertex_buffers[1] = g_floor_inst_buf;
+    f_binds.index_buffer = g_floor_mesh.ibuf;
+
+    f_binds.views[0] = g_floor_mesh.diffuse_view;
+    f_binds.samplers[0].id = g_sampler.id;
+    sg_apply_bindings(&f_binds);
+
+    sg_range params_range = SG_RANGE(vs_params);
+    sg_apply_uniforms(0, &params_range);
+
+    sg_draw(0, g_floor_mesh.num_indices, g_num_floor_instances);
   }
 
   sg_end_pass();
@@ -214,7 +278,9 @@ static void frame_cb(void) {
 // Callback: se ejecuta al cerrar la aplicación
 static void cleanup_cb(void) {
   g_wall_mesh.destroy();
+  g_floor_mesh.destroy();
   sg_destroy_buffer(g_inst_buf);
+  sg_destroy_buffer(g_floor_inst_buf);
   sg_destroy_pipeline(g_pip);
   sg_destroy_sampler(g_sampler);
   sg_shutdown();
