@@ -1,29 +1,24 @@
-#include "level.hpp"
-#include "object_collection.hpp"
+#include "game.hpp"
 
 int main() {
+  GameConfig config;
   int base_size = 10;
-  Level levels[3];
-  create_levels(levels, base_size);
 
+  // Crear los 3 niveles
+  create_levels(config.levels, base_size);
+
+  // Colocar colectables en cada nivel
   for (int i = 0; i < 3; i++) {
-    Collectable collectables[7]; // Máximo 7 items
+    config.collectable_count[i] = place_collectables(
+        config.collectables[i], config.levels[i].map->rooms,
+        config.levels[i].map->room_count, config.levels[i].map->get_matrix());
 
-    int placed = place_collectables(collectables, levels[i].map->rooms,
-                                    levels[i].map->room_count,
-                                    levels[i].map->get_matrix());
-
-    levels[i].print();
-
-    std::cout << "Colectables colocados: " << placed << std::endl;
-    for (int j = 0; j < placed; j++) {
-      std::cout << "  - Item " << j + 1
-                << ": textura=" << collectables[j].texture_id << " pos=("
-                << collectables[j].x << "," << collectables[j].y << ")"
-                << std::endl;
-    }
-    std::cout << std::endl;
+    config.levels[i].print();
+    std::cout << "Colectables: " << config.collectable_count[i] << std::endl;
   }
+
+  // Iniciar el juego con la configuración generada
+  run_game(&config);
 
   return 0;
 }
