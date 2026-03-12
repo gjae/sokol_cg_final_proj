@@ -114,37 +114,13 @@ protected:
   }
 
   // Cava un pasillo horizontal desde x1 hasta x2 en la fila y
-  void carve_horizontal_corridor(int x1, int x2, int y) {
+  void carve_horizontal_corridor(int x1, int x2, int y,
+                                 const RoomTexture &texture) {
     int start = (x1 < x2) ? x1 : x2;
     int end = (x1 < x2) ? x2 : x1;
 
-    // Crear un área de pasillo con textura aleatoria
-    RoomTexture rtex;
-    int type = rand_range(1, 5);
-    switch (type) {
-    case 1:
-      rtex.base = "Gem";
-      break;
-    case 2:
-      rtex.base = "Metal";
-      break;
-    case 3:
-      rtex.base = "Stone";
-      break;
-    case 4:
-      rtex.base = "Terrain";
-      break;
-    case 5:
-      rtex.base = "Weave";
-      break;
-    default:
-      rtex.base = "Stone";
-      break;
-    }
-    rtex.id = rand_range(1, 24);
-
     if (room_count < MAX_ROOM_ATTEMPTS) {
-      rooms[room_count] = {start, y, end - start + 1, 1, 6, rtex};
+      rooms[room_count] = {start, y, end - start + 1, 1, 6, texture};
       room_count++;
     }
 
@@ -156,37 +132,13 @@ protected:
   }
 
   // Cava un pasillo vertical desde y1 hasta y2 en la columna x
-  void carve_vertical_corridor(int y1, int y2, int x) {
+  void carve_vertical_corridor(int y1, int y2, int x,
+                               const RoomTexture &texture) {
     int start = (y1 < y2) ? y1 : y2;
     int end = (y1 < y2) ? y2 : y1;
 
-    // Crear un área de pasillo con textura aleatoria
-    RoomTexture rtex;
-    int type = rand_range(1, 5);
-    switch (type) {
-    case 1:
-      rtex.base = "Gem";
-      break;
-    case 2:
-      rtex.base = "Metal";
-      break;
-    case 3:
-      rtex.base = "Stone";
-      break;
-    case 4:
-      rtex.base = "Terrain";
-      break;
-    case 5:
-      rtex.base = "Weave";
-      break;
-    default:
-      rtex.base = "Stone";
-      break;
-    }
-    rtex.id = rand_range(1, 24);
-
     if (room_count < MAX_ROOM_ATTEMPTS) {
-      rooms[room_count] = {x, start, 1, end - start + 1, 6, rtex};
+      rooms[room_count] = {x, start, 1, end - start + 1, 6, texture};
       room_count++;
     }
 
@@ -263,8 +215,8 @@ protected:
         int new_cy = new_room.center_y();
 
         // Primero horizontal, luego vertical
-        carve_horizontal_corridor(prev_cx, new_cx, prev_cy);
-        carve_vertical_corridor(prev_cy, new_cy, new_cx);
+        carve_horizontal_corridor(prev_cx, new_cx, prev_cy, new_room.texture);
+        carve_vertical_corridor(prev_cy, new_cy, new_cx, new_room.texture);
       }
 
       rooms[room_count] = new_room;
