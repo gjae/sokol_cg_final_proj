@@ -372,8 +372,33 @@ static void frame_cb(void) {
   vs_params.view = view;
   vs_params.proj = proj;
 
-  fs_params_t fs_params;
+  fs_params_t fs_params = {};
   fs_params.light_dir = HMM_V3(0.3f, -1.0f, 0.2f);
+
+  // Rellenar luces de las salas
+  int room_count = g_config.levels[g_config.current_level].map->room_count;
+  int num_lights_to_send = std::min(room_count, MAX_ROOM_LIGHTS);
+  fs_params.num_lights = (float)num_lights_to_send;
+
+  for (int i = 0; i < num_lights_to_send; i++) {
+    Room r = g_config.levels[g_config.current_level].map->rooms[i];
+
+    // Centro geómetrico exacto (tomando en cuenta ancho/largo y el cw)
+    // El 'Y' en grilla es el eje -X 3D, el 'X' en grilla es el eje Z 3D
+    float mid_z = r.y + (r.h - 1) / 2.0f;
+    float mid_x = r.x + (r.w - 1) / 2.0f;
+
+    float world_x = -mid_z * cw;
+    float world_z = mid_x * cw;
+    float world_y = 2.0f; // Altura de luz
+
+    // El radio debe iluminar la habitación pero detenerse en las paredes
+    // Por eso tomamos el borde más ancho y le sumamos un margen leve
+    float max_dim = (float)std::max(r.w, r.h);
+    float radius = (max_dim / 2.0f + 0.8f) * cw;
+
+    fs_params.room_lights[i] = HMM_V4(world_x, world_y, world_z, radius);
+  }
 
   sg_pass pass = {};
   pass.action.colors[0].load_action = SG_LOADACTION_CLEAR;

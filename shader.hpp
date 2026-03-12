@@ -10,8 +10,12 @@ struct vs_params_t {
   HMM_Mat4 proj;
 };
 
+#define MAX_ROOM_LIGHTS 30
+
 struct fs_params_t {
   HMM_Vec3 light_dir;
+  float num_lights;
+  HMM_Vec4 room_lights[MAX_ROOM_LIGHTS]; // XYZ = pos, W = radio
 };
 
 // Shader code for OpenGL GLSL 330
@@ -45,6 +49,8 @@ uniform sampler2D tex_norm;
 uniform sampler2D tex_orm;
 uniform sampler2D tex_emit;
 uniform vec3 light_dir;
+uniform float num_lights;
+uniform vec4 room_lights[30];
 
 in vec2 v_uv;
 in vec3 v_normal;
@@ -71,22 +77,43 @@ vec3 getNormal() {
 void main() {
     vec4 base_color = texture(tex, v_uv);
     vec3 N = getNormal();
-    vec3 L = normalize(-light_dir);
     
     // ORM Map: R=ambient_occlusion, G=roughness, B=metallic
     vec3 orm = texture(tex_orm, v_uv).rgb;
     float ao = orm.r;
     
-    // Diffuse (directional light — no distance attenuation)
-    float diff = max(dot(N, L), 0.0);
-    
+    // Iluminación Direccional (Ambiental Base)
+    vec3 L_dir = normalize(-light_dir);
+    float diff_dir = max(dot(N, L_dir), 0.0);
     float ambient = 0.35 * ao;
-    float lighting = diff * 0.7 + ambient;
+    float lighting_acc = diff_dir * 0.7 + ambient;
+
+    // Acumular luces puntuales de las salas
+    int count = int(num_lights);
+    for(int i = 0; i < count; i++) {
+        vec3 l_pos = room_lights[i].xyz;
+        float radius = room_lights[i].w;
+        
+        vec3 L_to_point = l_pos - v_world_pos;
+        float dist = length(L_to_point);
+        
+        if (dist < radius) {
+            vec3 L_point = L_to_point / dist;
+            float diff_point = max(dot(N, L_point), 0.0);
+            
+            // Atenuación no lineal suave (cae a 0 justo en el borde)
+            float atten = max(0.0, 1.0 - (dist / radius));
+            atten = pow(atten, 2.0); // Opcionalmente al cuadrado para suavizar
+            
+            // Potencia de la luz de sala (fuerte en el centro)
+            lighting_acc += diff_point * atten * 1.5;
+        }
+    }
     
     // Emissive
-    vec3 emissive = texture(tex_emit, v_uv).rgb * 2.0; // Boost emissive
+    vec3 emissive = texture(tex_emit, v_uv).rgb * 2.0;
     
-    vec3 final_rgb = base_color.rgb * lighting + emissive;
+    vec3 final_rgb = base_color.rgb * lighting_acc + emissive;
     frag_color = vec4(final_rgb, base_color.a);
 }
 )";
@@ -111,6 +138,11 @@ inline sg_shader create_instanced_shader() {
   desc.uniform_blocks[1].size = sizeof(fs_params_t);
   desc.uniform_blocks[1].glsl_uniforms[0].type = SG_UNIFORMTYPE_FLOAT3;
   desc.uniform_blocks[1].glsl_uniforms[0].glsl_name = "light_dir";
+  desc.uniform_blocks[1].glsl_uniforms[1].type = SG_UNIFORMTYPE_FLOAT;
+  desc.uniform_blocks[1].glsl_uniforms[1].glsl_name = "num_lights";
+  desc.uniform_blocks[1].glsl_uniforms[2].type = SG_UNIFORMTYPE_FLOAT4;
+  desc.uniform_blocks[1].glsl_uniforms[2].array_count = MAX_ROOM_LIGHTS;
+  desc.uniform_blocks[1].glsl_uniforms[2].glsl_name = "room_lights";
 
   // Set up images
   for (int i = 0; i < 4; i++) {
