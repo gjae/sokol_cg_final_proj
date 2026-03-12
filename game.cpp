@@ -222,17 +222,23 @@ static void init_cb(void) {
       tg.emissive_view = g_dummy_black_view;
 
       // Intentar cargar
-      Mesh dummy_mesh;
+      Mesh dummy_mesh = {};
       load_textures(tex_path, dummy_mesh);
       if (dummy_mesh.diffuse_img.id != SG_INVALID_ID) {
         tg.diffuse_img = dummy_mesh.diffuse_img;
         tg.diffuse_view = dummy_mesh.diffuse_view;
-        tg.normal_img = dummy_mesh.normal_img;
-        tg.normal_view = dummy_mesh.normal_view;
-        tg.orm_img = dummy_mesh.orm_img;
-        tg.orm_view = dummy_mesh.orm_view;
-        tg.emissive_img = dummy_mesh.emissive_img;
-        tg.emissive_view = dummy_mesh.emissive_view;
+        if (dummy_mesh.normal_view.id != SG_INVALID_ID) {
+          tg.normal_img = dummy_mesh.normal_img;
+          tg.normal_view = dummy_mesh.normal_view;
+        }
+        if (dummy_mesh.orm_view.id != SG_INVALID_ID) {
+          tg.orm_img = dummy_mesh.orm_img;
+          tg.orm_view = dummy_mesh.orm_view;
+        }
+        if (dummy_mesh.emissive_view.id != SG_INVALID_ID) {
+          tg.emissive_img = dummy_mesh.emissive_img;
+          tg.emissive_view = dummy_mesh.emissive_view;
+        }
       }
       g_floor_groups[tex_key] = tg;
     }

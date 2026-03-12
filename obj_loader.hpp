@@ -50,6 +50,8 @@ struct Mesh {
 };
 
 inline void load_textures(const std::string &tex_path, Mesh &out_mesh) {
+  if (tex_path.empty())
+    return;
   // Helper function to load complementary textures
   auto load_sub_tex = [&](const std::string &suffix, sg_image &out_img,
                           sg_view &out_view) {
