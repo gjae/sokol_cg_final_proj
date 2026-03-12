@@ -400,6 +400,10 @@ static void frame_cb(void) {
     fs_params.room_lights[i] = HMM_V4(world_x, world_y, world_z, radius);
   }
 
+  // Enviar posición del jugador y el radio de sub-iluminación
+  fs_params.player_light = HMM_V4(g_camera.position.X, g_camera.position.Y,
+                                  g_camera.position.Z, 15.0f);
+
   sg_pass pass = {};
   pass.action.colors[0].load_action = SG_LOADACTION_CLEAR;
   pass.action.colors[0].clear_value = {0.05f, 0.05f, 0.15f, 1.0f};

@@ -16,6 +16,7 @@ struct fs_params_t {
   HMM_Vec3 light_dir;
   float num_lights;
   HMM_Vec4 room_lights[MAX_ROOM_LIGHTS]; // XYZ = pos, W = radio
+  HMM_Vec4 player_light;                 // XYZ = pos, W = radio
 };
 
 // Shader code for OpenGL GLSL 330
@@ -51,6 +52,7 @@ uniform sampler2D tex_emit;
 uniform vec3 light_dir;
 uniform float num_lights;
 uniform vec4 room_lights[30];
+uniform vec4 player_light;
 
 in vec2 v_uv;
 in vec3 v_normal;
@@ -110,6 +112,23 @@ void main() {
         }
     }
     
+    // Luz del jugador (linterna omnidireccional)
+    vec3 p_pos = player_light.xyz;
+    float p_radius = player_light.w;
+    vec3 L_to_player = p_pos - v_world_pos;
+    float p_dist = length(L_to_player);
+    
+    if (p_dist < p_radius) {
+        vec3 L_player = L_to_player / p_dist;
+        float diff_player = max(dot(N, L_player), 0.0);
+        
+        // Atenuación suave para el jugador
+        float atten_p = max(0.0, 1.0 - (p_dist / p_radius));
+        atten_p = pow(atten_p, 2.0);
+        
+        lighting_acc += diff_player * atten_p * 1.5;
+    }
+    
     // Emissive
     vec3 emissive = texture(tex_emit, v_uv).rgb * 2.0;
     
@@ -143,6 +162,8 @@ inline sg_shader create_instanced_shader() {
   desc.uniform_blocks[1].glsl_uniforms[2].type = SG_UNIFORMTYPE_FLOAT4;
   desc.uniform_blocks[1].glsl_uniforms[2].array_count = MAX_ROOM_LIGHTS;
   desc.uniform_blocks[1].glsl_uniforms[2].glsl_name = "room_lights";
+  desc.uniform_blocks[1].glsl_uniforms[3].type = SG_UNIFORMTYPE_FLOAT4;
+  desc.uniform_blocks[1].glsl_uniforms[3].glsl_name = "player_light";
 
   // Set up images
   for (int i = 0; i < 4; i++) {
