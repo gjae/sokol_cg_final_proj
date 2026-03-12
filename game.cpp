@@ -30,9 +30,7 @@ static Mesh g_wall_mesh;
 static Mesh g_floor_mesh;
 static sg_pipeline g_pip;
 static sg_buffer g_inst_buf;
-static sg_buffer g_floor_inst_buf;
 static int g_num_instances = 0;
-static int g_num_floor_instances = 0;
 static sg_sampler g_sampler;
 static sg_view g_dummy_white_view;
 static sg_view g_dummy_black_view;
@@ -42,6 +40,36 @@ static sg_image g_dummy_white_img;
 static sg_image g_dummy_black_img;
 static sg_image g_dummy_normal_img;
 static sg_image g_dummy_orm_img;
+
+struct TextureGroup {
+  sg_image diffuse_img;
+  sg_view diffuse_view;
+  sg_image normal_img;
+  sg_view normal_view;
+  sg_image orm_img;
+  sg_view orm_view;
+  sg_image emissive_img;
+  sg_view emissive_view;
+  std::vector<HMM_Mat4> instances;
+  sg_buffer inst_buf;
+  int num_instances = 0;
+
+  void destroy() {
+    if (diffuse_img.id != SG_INVALID_ID)
+      sg_destroy_image(diffuse_img);
+    if (normal_img.id != SG_INVALID_ID)
+      sg_destroy_image(normal_img);
+    if (orm_img.id != SG_INVALID_ID)
+      sg_destroy_image(orm_img);
+    if (emissive_img.id != SG_INVALID_ID)
+      sg_destroy_image(emissive_img);
+    if (inst_buf.id != SG_INVALID_ID)
+      sg_destroy_buffer(inst_buf);
+  }
+};
+
+#include <map>
+static std::map<std::string, TextureGroup> g_floor_groups;
 
 // Genera un quad plano de 4x4 unidades (centrado en el origen, Y=0)
 static void create_floor_quad(Mesh &out_mesh, const std::string &tex_path) {
@@ -159,84 +187,122 @@ static void init_cb(void) {
   }
 
   // Generar quad plano para el suelo (evita discontinuidades del OBJ)
-  std::string floor_tex_path = "assets/scifi/Textures/T_Trim_01_BaseColor.png";
-  create_floor_quad(g_floor_mesh, floor_tex_path);
+  // Nota: Ya no cargamos una sola textura para el suelo, se hará por grupo.
+  create_floor_quad(g_floor_mesh, ""); // "" indica que no cargue texturas aquí
 
   // Generar instancias de la pared y suelo según el mapa
-  std::vector<HMM_Mat4> instances;
-  std::vector<HMM_Mat4> floor_instances;
+  std::vector<HMM_Mat4> wall_instances;
   int **matrix = g_config.levels[lvl].map->get_matrix();
   int size = g_config.levels[lvl].map->get_size();
-
-  // Las baldosas miden exactamente 4.0f x 4.0f unidades en el archivo OBJ.
-  // Ajustar la distancia entre celdas del mapa (cw) para que coincida
-  // exactamente y no haya huecos.
   float cw = 4.0f;
-  float half_cw = cw * 0.5f;
 
-  for (int z = 0; z < size; z++) {
-    for (int x = 0; x < size; x++) {
-      if (matrix[z][x] != 0) { // Cualquier valor != 0 es espacio transitable
-        float cx = -z * cw;
-        float cz = x * cw;
+  // Visitados para no duplicar suelo
+  std::vector<std::vector<bool>> visited(size, std::vector<bool>(size, false));
 
-        HMM_Mat4 tf = HMM_Translate(HMM_V3(cx, 0.0f, cz));
+  // Primero: Procesar todas las áreas (salas y pasillos) para el suelo
+  for (int i = 0; i < g_config.levels[lvl].map->room_count; i++) {
+    Room &r = g_config.levels[lvl].map->rooms[i];
 
-        // Instanciar suelo (quad plano, sin escala extra)
-        floor_instances.push_back(tf);
+    char id_str[4];
+    snprintf(id_str, sizeof(id_str), "%02d", r.texture.id);
+    std::string tex_key =
+        r.texture.base + "/" + r.texture.base + "_" + id_str + "-512x512.png";
+    std::string tex_path = "assets/textures_id_bind/" + tex_key;
 
-        // La pared "Astra_Straight" NO está centrada. Su cara interna está en
-        // X=-1.56. El borde del suelo está en X=-2.0. Aplicamos un offset de
-        // -0.44 para alinear.
-        HMM_Mat4 wall_offset = HMM_Translate(HMM_V3(-0.44f, 0.0f, 0.0f));
+    if (g_floor_groups.find(tex_key) == g_floor_groups.end()) {
+      TextureGroup tg;
+      // Inicializar con dummies por si acaso
+      tg.diffuse_img = g_dummy_white_img;
+      tg.diffuse_view = g_dummy_white_view;
+      tg.normal_img = g_dummy_normal_img;
+      tg.normal_view = g_dummy_normal_view;
+      tg.orm_img = g_dummy_orm_img;
+      tg.orm_view = g_dummy_orm_view;
+      tg.emissive_img = g_dummy_black_img;
+      tg.emissive_view = g_dummy_black_view;
 
-        // -X edge in 3D (z+1 in map)
-        if (z == size - 1 || matrix[z + 1][x] == 0) {
-          instances.push_back(HMM_MulM4(tf, wall_offset));
-        }
-        // +X edge in 3D (z-1 in map)
-        if (z == 0 || matrix[z - 1][x] == 0) {
-          HMM_Mat4 rot = HMM_Rotate_RH(HMM_AngleDeg(180.0f), HMM_V3(0, 1, 0));
-          instances.push_back(HMM_MulM4(tf, HMM_MulM4(rot, wall_offset)));
-        }
-        // -Z edge in 3D (x-1 in map)
-        if (x == 0 || matrix[z][x - 1] == 0) {
-          HMM_Mat4 rot = HMM_Rotate_RH(HMM_AngleDeg(-90.0f), HMM_V3(0, 1, 0));
-          instances.push_back(HMM_MulM4(tf, HMM_MulM4(rot, wall_offset)));
-        }
-        // +Z edge in 3D (x+1 in map)
-        if (x == size - 1 || matrix[z][x + 1] == 0) {
-          HMM_Mat4 rot = HMM_Rotate_RH(HMM_AngleDeg(90.0f), HMM_V3(0, 1, 0));
-          instances.push_back(HMM_MulM4(tf, HMM_MulM4(rot, wall_offset)));
+      // Intentar cargar
+      Mesh dummy_mesh;
+      load_textures(tex_path, dummy_mesh);
+      if (dummy_mesh.diffuse_img.id != SG_INVALID_ID) {
+        tg.diffuse_img = dummy_mesh.diffuse_img;
+        tg.diffuse_view = dummy_mesh.diffuse_view;
+        tg.normal_img = dummy_mesh.normal_img;
+        tg.normal_view = dummy_mesh.normal_view;
+        tg.orm_img = dummy_mesh.orm_img;
+        tg.orm_view = dummy_mesh.orm_view;
+        tg.emissive_img = dummy_mesh.emissive_img;
+        tg.emissive_view = dummy_mesh.emissive_view;
+      }
+      g_floor_groups[tex_key] = tg;
+    }
+
+    TextureGroup &group = g_floor_groups[tex_key];
+    for (int ry = r.y; ry < r.y + r.h; ry++) {
+      for (int rx = r.x; rx < r.x + r.w; rx++) {
+        if (ry >= 0 && ry < size && rx >= 0 && rx < size) {
+          if (!visited[ry][rx]) {
+            visited[ry][rx] = true;
+            HMM_Mat4 tf = HMM_Translate(HMM_V3(-ry * cw, 0.0f, rx * cw));
+            group.instances.push_back(tf);
+          }
         }
       }
     }
   }
 
-  // Fallback to avoid Sokol crashing on size=0 buffers from empty procedural
-  // maps
-  if (instances.empty()) {
-    instances.push_back(HMM_Scale(HMM_V3(0.0f, 0.0f, 0.0f)));
-  }
-  if (floor_instances.empty()) {
-    floor_instances.push_back(HMM_Scale(HMM_V3(0.0f, 0.0f, 0.0f)));
+  // Segundo: Procesar paredes basándose en la matriz
+  for (int z = 0; z < size; z++) {
+    for (int x = 0; x < size; x++) {
+      if (matrix[z][x] != 0) {
+        float cx = -z * cw;
+        float cz = x * cw;
+        HMM_Mat4 tf = HMM_Translate(HMM_V3(cx, 0.0f, cz));
+        HMM_Mat4 wall_offset = HMM_Translate(HMM_V3(-0.44f, 0.0f, 0.0f));
+
+        if (z == size - 1 || matrix[z + 1][x] == 0) {
+          wall_instances.push_back(HMM_MulM4(tf, wall_offset));
+        }
+        if (z == 0 || matrix[z - 1][x] == 0) {
+          HMM_Mat4 rot = HMM_Rotate_RH(HMM_AngleDeg(180.0f), HMM_V3(0, 1, 0));
+          wall_instances.push_back(HMM_MulM4(tf, HMM_MulM4(rot, wall_offset)));
+        }
+        if (x == 0 || matrix[z][x - 1] == 0) {
+          HMM_Mat4 rot = HMM_Rotate_RH(HMM_AngleDeg(-90.0f), HMM_V3(0, 1, 0));
+          wall_instances.push_back(HMM_MulM4(tf, HMM_MulM4(rot, wall_offset)));
+        }
+        if (x == size - 1 || matrix[z][x + 1] == 0) {
+          HMM_Mat4 rot = HMM_Rotate_RH(HMM_AngleDeg(90.0f), HMM_V3(0, 1, 0));
+          wall_instances.push_back(HMM_MulM4(tf, HMM_MulM4(rot, wall_offset)));
+        }
+      }
+    }
   }
 
-  g_num_instances = (int)instances.size();
-  g_num_floor_instances = (int)floor_instances.size();
+  if (wall_instances.empty()) {
+    wall_instances.push_back(HMM_Scale(HMM_V3(0.0f, 0.0f, 0.0f)));
+  }
+
+  g_num_instances = (int)wall_instances.size();
 
   // Buffer de instanciación para paredes
   sg_buffer_desc inst_desc = {};
   inst_desc.usage.vertex_buffer = true;
-  inst_desc.data = {instances.data(), instances.size() * sizeof(HMM_Mat4)};
+  inst_desc.data = {wall_instances.data(),
+                    wall_instances.size() * sizeof(HMM_Mat4)};
   g_inst_buf = sg_make_buffer(&inst_desc);
 
-  // Buffer de instanciación para el suelo
-  sg_buffer_desc floor_inst_desc = {};
-  floor_inst_desc.usage.vertex_buffer = true;
-  floor_inst_desc.data = {floor_instances.data(),
-                          floor_instances.size() * sizeof(HMM_Mat4)};
-  g_floor_inst_buf = sg_make_buffer(&floor_inst_desc);
+  // Crear buffers de instanciación para cada grupo de suelo
+  for (auto &it : g_floor_groups) {
+    if (it.second.instances.empty())
+      continue;
+    it.second.num_instances = (int)it.second.instances.size();
+    sg_buffer_desc f_inst_desc = {};
+    f_inst_desc.usage.vertex_buffer = true;
+    f_inst_desc.data = {it.second.instances.data(),
+                        it.second.instances.size() * sizeof(HMM_Mat4)};
+    it.second.inst_buf = sg_make_buffer(&f_inst_desc);
+  }
 
   // Crear Sampler genérico
   sg_sampler_desc smp_desc = {};
@@ -441,33 +507,26 @@ static void frame_cb(void) {
 
     sg_range fs_range = SG_RANGE(fs_params);
     sg_apply_uniforms(1, &fs_range);
-
     // Draw walls
     sg_draw(0, g_wall_mesh.num_indices, g_num_instances);
   }
 
-  // Draw floors
-  if (g_floor_mesh.num_indices > 0 &&
-      g_floor_mesh.diffuse_img.id != SG_INVALID_ID) {
-    // Reutilizamos el mismo pipeline estático pero cambiamos los bindings
+  // Draw floors grouped by texture
+  for (auto &it : g_floor_groups) {
+    TextureGroup &group = it.second;
+    if (group.num_instances <= 0)
+      continue;
+
     sg_apply_pipeline(g_pip);
     sg_bindings f_binds = {};
     f_binds.vertex_buffers[0] = g_floor_mesh.vbuf;
-    f_binds.vertex_buffers[1] = g_floor_inst_buf;
+    f_binds.vertex_buffers[1] = group.inst_buf;
     f_binds.index_buffer = g_floor_mesh.ibuf;
 
-    f_binds.views[0] = (g_floor_mesh.diffuse_view.id != SG_INVALID_ID)
-                           ? g_floor_mesh.diffuse_view
-                           : g_dummy_white_view;
-    f_binds.views[1] = (g_floor_mesh.normal_view.id != SG_INVALID_ID)
-                           ? g_floor_mesh.normal_view
-                           : g_dummy_normal_view;
-    f_binds.views[2] = (g_floor_mesh.orm_view.id != SG_INVALID_ID)
-                           ? g_floor_mesh.orm_view
-                           : g_dummy_orm_view;
-    f_binds.views[3] = (g_floor_mesh.emissive_view.id != SG_INVALID_ID)
-                           ? g_floor_mesh.emissive_view
-                           : g_dummy_black_view;
+    f_binds.views[0] = group.diffuse_view;
+    f_binds.views[1] = group.normal_view;
+    f_binds.views[2] = group.orm_view;
+    f_binds.views[3] = group.emissive_view;
     f_binds.samplers[0].id = g_sampler.id;
     sg_apply_bindings(&f_binds);
 
@@ -477,7 +536,8 @@ static void frame_cb(void) {
     sg_range fs_range = SG_RANGE(fs_params);
     sg_apply_uniforms(1, &fs_range);
 
-    sg_draw(0, g_floor_mesh.num_indices, g_num_floor_instances);
+    // Draw this group of floor tiles
+    sg_draw(0, g_floor_mesh.num_indices, group.num_instances);
   }
 
   sg_end_pass();
@@ -488,8 +548,14 @@ static void frame_cb(void) {
 static void cleanup_cb(void) {
   g_wall_mesh.destroy();
   g_floor_mesh.destroy();
+
+  // Limpiar grupos de suelo
+  for (auto &it : g_floor_groups) {
+    it.second.destroy();
+  }
+  g_floor_groups.clear();
+
   sg_destroy_buffer(g_inst_buf);
-  sg_destroy_buffer(g_floor_inst_buf);
   sg_destroy_pipeline(g_pip);
   sg_destroy_sampler(g_sampler);
   sg_destroy_image(g_dummy_white_img);

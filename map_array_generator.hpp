@@ -4,10 +4,17 @@
 #include <cstdlib>
 #include <ctime>
 #include <iostream>
+#include <string>
+
+struct RoomTexture {
+  std::string base;
+  int id;
+};
 
 struct Room {
   int x, y, w, h;
   int room_type;
+  RoomTexture texture;
 
   int center_x() const { return x + w / 2; }
   int center_y() const { return y + h / 2; }
@@ -69,7 +76,8 @@ protected:
   // Parámetros de generación
   static const int ROOM_MIN_SIZE = 3;
   static const int ROOM_MAX_SIZE = 5;
-  static const int MAX_ROOM_ATTEMPTS = 20;
+  static const int MAX_ROOM_ATTEMPTS =
+      50; // Aumentado para incluir pasillos como áreas
 
   int rand_range(int min, int max) { return min + (rand() % (max - min + 1)); }
 
@@ -109,9 +117,40 @@ protected:
   void carve_horizontal_corridor(int x1, int x2, int y) {
     int start = (x1 < x2) ? x1 : x2;
     int end = (x1 < x2) ? x2 : x1;
+
+    // Crear un área de pasillo con textura aleatoria
+    RoomTexture rtex;
+    int type = rand_range(1, 5);
+    switch (type) {
+    case 1:
+      rtex.base = "Gem";
+      break;
+    case 2:
+      rtex.base = "Metal";
+      break;
+    case 3:
+      rtex.base = "Stone";
+      break;
+    case 4:
+      rtex.base = "Terrain";
+      break;
+    case 5:
+      rtex.base = "Weave";
+      break;
+    default:
+      rtex.base = "Stone";
+      break;
+    }
+    rtex.id = rand_range(1, 24);
+
+    if (room_count < MAX_ROOM_ATTEMPTS) {
+      rooms[room_count] = {start, y, end - start + 1, 1, 6, rtex};
+      room_count++;
+    }
+
     for (int col = start; col <= end; col++) {
       if (y >= 0 && y < N && col >= 0 && col < N) {
-        matrix[y][col] = 1;
+        matrix[y][col] = 6; // 6 para pasillos
       }
     }
   }
@@ -120,9 +159,40 @@ protected:
   void carve_vertical_corridor(int y1, int y2, int x) {
     int start = (y1 < y2) ? y1 : y2;
     int end = (y1 < y2) ? y2 : y1;
+
+    // Crear un área de pasillo con textura aleatoria
+    RoomTexture rtex;
+    int type = rand_range(1, 5);
+    switch (type) {
+    case 1:
+      rtex.base = "Gem";
+      break;
+    case 2:
+      rtex.base = "Metal";
+      break;
+    case 3:
+      rtex.base = "Stone";
+      break;
+    case 4:
+      rtex.base = "Terrain";
+      break;
+    case 5:
+      rtex.base = "Weave";
+      break;
+    default:
+      rtex.base = "Stone";
+      break;
+    }
+    rtex.id = rand_range(1, 24);
+
+    if (room_count < MAX_ROOM_ATTEMPTS) {
+      rooms[room_count] = {x, start, 1, end - start + 1, 6, rtex};
+      room_count++;
+    }
+
     for (int row = start; row <= end; row++) {
       if (row >= 0 && row < N && x >= 0 && x < N) {
-        matrix[row][x] = 1;
+        matrix[row][x] = 6; // 6 para pasillos
       }
     }
   }
@@ -153,7 +223,30 @@ protected:
       int y = rand_range(1, N - h - 1);
 
       int type = rand_range(1, 5);
-      Room new_room = {x, y, w, h, type};
+      RoomTexture rtex;
+      switch (type) {
+      case 1:
+        rtex.base = "Gem";
+        break;
+      case 2:
+        rtex.base = "Metal";
+        break;
+      case 3:
+        rtex.base = "Stone";
+        break;
+      case 4:
+        rtex.base = "Terrain";
+        break;
+      case 5:
+        rtex.base = "Weave";
+        break;
+      default:
+        rtex.base = "Stone";
+        break;
+      }
+      rtex.id = rand_range(1, 24);
+
+      Room new_room = {x, y, w, h, type, rtex};
 
       if (!can_place_room(new_room)) {
         continue;
