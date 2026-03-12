@@ -26,29 +26,117 @@ struct Mesh {
   sg_buffer ibuf;
   sg_image diffuse_img;
   sg_view diffuse_view;
+  sg_image normal_img;
+  sg_view normal_view;
+  sg_image orm_img;
+  sg_view orm_view;
+  sg_image emissive_img;
+  sg_view emissive_view;
+
   int num_indices;
 
   void destroy() {
     sg_destroy_buffer(vbuf);
     sg_destroy_buffer(ibuf);
-    sg_destroy_image(diffuse_img);
-    // Note: older/different sokol versions might not have destroy view strictly
-    // required if image is destroyed, but typically we should if it's
-    // available. If sg_destroy_view doesn't exist, we leave it out. But
-    // typically it's needed? Actually, let's omit sg_destroy_view just in case
-    // it doesn't exist in simpler backends, deleting the image often
-    // invalidates the view. Wait, I'll destroy it anyway if it parses. But
-    // let's check sokol_gfx.h if sg_destroy_view exists. Wait, let's just leave
-    // it out to prevent another potential compiler error if it's not exported.
+    if (diffuse_img.id != SG_INVALID_ID)
+      sg_destroy_image(diffuse_img);
+    if (normal_img.id != SG_INVALID_ID)
+      sg_destroy_image(normal_img);
+    if (orm_img.id != SG_INVALID_ID)
+      sg_destroy_image(orm_img);
+    if (emissive_img.id != SG_INVALID_ID)
+      sg_destroy_image(emissive_img);
   }
 };
+
+inline void load_textures(const std::string &tex_path, Mesh &out_mesh) {
+  // Helper function to load complementary textures
+  auto load_sub_tex = [&](const std::string &suffix, sg_image &out_img,
+                          sg_view &out_view) {
+    std::string path = tex_path;
+
+    // Replace "_BaseColor" with the suffix if it exists
+    size_t base_color_idx = path.find("_BaseColor");
+    std::string sub_path;
+
+    if (base_color_idx != std::string::npos) {
+      sub_path = path;
+      sub_path.replace(base_color_idx, 10,
+                       suffix); // 10 is length of "_BaseColor"
+    } else {
+      // Fallback: just append before the extension
+      size_t dot_pos = path.rfind('.');
+      if (dot_pos != std::string::npos) {
+        std::string base = path.substr(0, dot_pos);
+        std::string ext = path.substr(dot_pos);
+        sub_path = base + suffix + ext;
+      } else {
+        sub_path = path + suffix;
+      }
+    }
+
+    int w, h, c;
+    stbi_uc *pix = stbi_load(sub_path.c_str(), &w, &h, &c, 4);
+    if (pix) {
+      sg_image_desc d = {};
+      d.width = w;
+      d.height = h;
+      d.pixel_format = SG_PIXELFORMAT_RGBA8;
+      d.data.mip_levels[0].ptr = pix;
+      d.data.mip_levels[0].size = (size_t)(w * h * 4);
+      out_img = sg_make_image(&d);
+
+      sg_view_desc vd = {};
+      vd.texture.image = out_img;
+      out_view = sg_make_view(&vd);
+      stbi_image_free(pix);
+      return true;
+    }
+    return false;
+  };
+
+  stbi_set_flip_vertically_on_load(false);
+  int width, height, channels;
+  stbi_uc *pixels = stbi_load(tex_path.c_str(), &width, &height, &channels, 4);
+  if (pixels) {
+    sg_image_desc img_desc = {};
+    img_desc.width = width;
+    img_desc.height = height;
+    img_desc.pixel_format = SG_PIXELFORMAT_RGBA8;
+    img_desc.data.mip_levels[0].ptr = pixels;
+    img_desc.data.mip_levels[0].size = (size_t)(width * height * 4);
+    out_mesh.diffuse_img = sg_make_image(&img_desc);
+
+    sg_view_desc view_desc = {};
+    view_desc.texture.image = out_mesh.diffuse_img;
+    out_mesh.diffuse_view = sg_make_view(&view_desc);
+
+    stbi_image_free(pixels);
+
+    // Attempt to load Normal, ORM, and Emissive
+    load_sub_tex("_Normal", out_mesh.normal_img, out_mesh.normal_view);
+    load_sub_tex("_ORM", out_mesh.orm_img, out_mesh.orm_view);
+    load_sub_tex("_Emissive", out_mesh.emissive_img, out_mesh.emissive_view);
+  } else {
+    std::cerr << "Failed to load texture: " << tex_path << std::endl;
+  }
+}
 
 inline bool load_obj(const std::string &obj_path, const std::string &tex_path,
                      Mesh &out_mesh) {
   tinyobj::ObjReaderConfig reader_config;
   reader_config.triangulate = true;
+
+  std::string base_dir = "";
+  size_t last_slash_idx = obj_path.rfind('/');
+  if (std::string::npos != last_slash_idx) {
+    base_dir = obj_path.substr(0, last_slash_idx + 1);
+  }
+  reader_config.mtl_search_path = base_dir;
+
   tinyobj::ObjReader reader;
 
+  // Pasamos el base_dir para que lea el archivo .mtl
   if (!reader.ParseFromFile(obj_path, reader_config)) {
     if (!reader.Error().empty())
       std::cerr << "ObjLoader Error: " << reader.Error();
@@ -103,35 +191,17 @@ inline bool load_obj(const std::string &obj_path, const std::string &tex_path,
   // Create Sokol buffers
   sg_buffer_desc vbuf_desc = {};
   vbuf_desc.usage.vertex_buffer = true;
-  vbuf_desc.data = SG_RANGE(out_mesh.vertices);
+  vbuf_desc.data = {out_mesh.vertices.data(),
+                    out_mesh.vertices.size() * sizeof(Vertex)};
   out_mesh.vbuf = sg_make_buffer(&vbuf_desc);
 
   sg_buffer_desc ibuf_desc = {};
   ibuf_desc.usage.index_buffer = true;
-  ibuf_desc.data = SG_RANGE(out_mesh.indices);
+  ibuf_desc.data = {out_mesh.indices.data(),
+                    out_mesh.indices.size() * sizeof(uint32_t)};
   out_mesh.ibuf = sg_make_buffer(&ibuf_desc);
 
-  // Load Texture
-  int width, height, channels;
-  stbi_set_flip_vertically_on_load(false); // Ya flipeamos UV arriba
-  stbi_uc *pixels = stbi_load(tex_path.c_str(), &width, &height, &channels, 4);
-  if (pixels) {
-    sg_image_desc img_desc = {};
-    img_desc.width = width;
-    img_desc.height = height;
-    img_desc.pixel_format = SG_PIXELFORMAT_RGBA8;
-    img_desc.data.mip_levels[0].ptr = pixels;
-    img_desc.data.mip_levels[0].size = (size_t)(width * height * 4);
-    out_mesh.diffuse_img = sg_make_image(&img_desc);
-
-    sg_view_desc view_desc = {};
-    view_desc.texture.image = out_mesh.diffuse_img;
-    out_mesh.diffuse_view = sg_make_view(&view_desc);
-
-    stbi_image_free(pixels);
-  } else {
-    std::cerr << "Failed to load texture: " << tex_path << std::endl;
-  }
+  load_textures(tex_path, out_mesh);
 
   return true;
 }

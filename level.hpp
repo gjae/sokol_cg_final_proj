@@ -44,6 +44,11 @@ inline void create_levels(Level levels[3], int base_size) {
     int size = base_size * (1 << i);
     levels[i].init(i + 1, size);
   }
+
+  for (int i = 0; i < 3; i++) {
+    printf("\n=== Niveles creados ===\n");
+    levels[i].print();
+  }
 }
 
 #endif // LEVEL_HPP

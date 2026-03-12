@@ -3,10 +3,13 @@
 
 #include "HandmadeMath.h"
 
+#include "collision_verify.hpp"
+
 struct Camera {
   HMM_Vec3 position;
   float yaw;
   float pitch;
+  Circle collider;
 
   HMM_Vec3 forward;
   HMM_Vec3 right;
@@ -16,6 +19,8 @@ struct Camera {
     position = HMM_V3(0.0f, 1.0f, 0.0f); // Default height
     yaw = 0.0f;                          // Looking along +X axis
     pitch = 0.0f;
+    collider.radius = 1.0f; // Tamaño del collider de la cámara
+
     update_vectors();
   }
 
