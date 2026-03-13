@@ -27,6 +27,7 @@ struct InputState {
   bool keys[512]; // Keep track of pressed keys
 };
 static InputState g_input = {};
+static bool g_show_minimap_aliens = false; // Flag for toggling minimap aliens
 static HMM_Mat4 view_mat;
 static HMM_Mat4 proj_mat;
 
@@ -1558,9 +1559,9 @@ static void frame_cb(void) {
       }
     }
 
-    // Dibujar puntos rojos para los aliens no recolectados si se presiona la
-    // tecla M
-    if (g_input.keys[SAPP_KEYCODE_M]) {
+    // Dibujar puntos rojos para los aliens no recolectados si el flag está
+    // activo
+    if (g_show_minimap_aliens) {
       int lvl_map = g_config.current_level;
       for (int i = 0; i < g_total_aliens; i++) {
         Collectable &c = g_config.collectables[lvl_map][i];
@@ -1885,6 +1886,10 @@ static void event_cb(const sapp_event *ev) {
     // Reiniciar juego desde la pantalla de victoria
     if (ev->key_code == SAPP_KEYCODE_SPACE && g_game_won) {
       g_restart_pending = true; // Diferir al frame_cb
+    }
+    // Toggle para mostrar aliens en el minimapa
+    if (ev->key_code == SAPP_KEYCODE_M) {
+      g_show_minimap_aliens = !g_show_minimap_aliens;
     }
     if (ev->key_code < 512) {
       g_input.keys[ev->key_code] = true;
