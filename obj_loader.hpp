@@ -205,6 +205,39 @@ inline bool load_obj(const std::string &obj_path, const std::string &tex_path,
 
   load_textures(tex_path, out_mesh);
 
+  // Fallback: If no texture was loaded, but the OBJ has a material with a
+  // diffuse color (Kd), create a 1x1 pixel texture matching that color so the
+  // shader renders it correctly.
+  if (out_mesh.diffuse_img.id == SG_INVALID_ID &&
+      !reader.GetMaterials().empty()) {
+    // Buscar un material válido (ignorando explícitamente materiales como
+    // "Eyes" o negros puros si existen múltiples)
+    int mat_idx = 0;
+    for (size_t i = 0; i < reader.GetMaterials().size(); i++) {
+      if (reader.GetMaterials()[i].name.find("Eyes") == std::string::npos) {
+        mat_idx = i;
+        break;
+      }
+    }
+    auto &mat = reader.GetMaterials()[mat_idx];
+    uint8_t r = (uint8_t)(mat.diffuse[0] * 255.0f);
+    uint8_t g = (uint8_t)(mat.diffuse[1] * 255.0f);
+    uint8_t b = (uint8_t)(mat.diffuse[2] * 255.0f);
+    uint32_t color = 0xFF000000 | (b << 16) | (g << 8) | r; // ABGR format
+
+    sg_image_desc d = {};
+    d.width = 1;
+    d.height = 1;
+    d.pixel_format = SG_PIXELFORMAT_RGBA8;
+    d.data.mip_levels[0].ptr = &color;
+    d.data.mip_levels[0].size = 4;
+    out_mesh.diffuse_img = sg_make_image(&d);
+
+    sg_view_desc vd = {};
+    vd.texture.image = out_mesh.diffuse_img;
+    out_mesh.diffuse_view = sg_make_view(&vd);
+  }
+
   return true;
 }
 

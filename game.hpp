@@ -7,7 +7,7 @@
 // Configuración del juego que se pasa desde main
 struct GameConfig {
   static const int START_LEVEL =
-      1; // Cambiar este valor para empezar en otro nivel (0, 1, 2)
+      0; // Cambiar este valor para empezar en otro nivel (0, 1, 2)
 
   Level levels[3];
   Collectable collectables[3][7]; // Colectables por nivel (max 7)

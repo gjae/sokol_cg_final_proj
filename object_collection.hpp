@@ -34,13 +34,14 @@ inline int place_collectables(Collectable *collectables, Room *rooms,
     int px = room.x + (rand() % room.w);
     int py = room.y + (rand() % room.h);
 
-    // Textura aleatoria entre 6 y 10
-    int tex_id = 6 + (rand() % 5);
+    // Assign an alien ID (100, 101, or 102 for the 3 alien types) instead of 2D
+    // textures
+    int alien_id = 100 + (rand() % 3);
 
-    collectables[placed] = Collectable(tex_id, px, py);
+    collectables[placed] = Collectable(alien_id, px, py);
 
     // Marcar la posición en la matriz
-    matrix[py][px] = tex_id;
+    matrix[py][px] = alien_id;
 
     placed++;
   }

@@ -13,7 +13,10 @@
 #include "obj_loader.hpp"
 #include "shader.hpp"
 #include <cstdio>
+#include <string>
 #include <vector>
+
+#include <map>
 
 // Estado global del juego
 static GameConfig g_config;
@@ -24,13 +27,52 @@ struct InputState {
   bool keys[512]; // Keep track of pressed keys
 };
 static InputState g_input = {};
+static HMM_Mat4 view_mat;
+static HMM_Mat4 proj_mat;
 
 // Recursos de Sokol
 static Mesh g_wall_mesh;
 static Mesh g_floor_mesh;
+// Meshes for alien collectables
+static Mesh g_alien_cyclop_mesh;
+static Mesh g_alien_scolitex_mesh;
+static Mesh g_alien_oculi_mesh;
+
 static sg_pipeline g_pip;
 static sg_buffer g_inst_buf;
 static int g_num_instances = 0;
+// Buffers unificados para aliens
+static sg_buffer g_alien_cyclop_inst_buf = {SG_INVALID_ID};
+static sg_buffer g_alien_scolitex_inst_buf = {SG_INVALID_ID};
+static sg_buffer g_alien_oculi_inst_buf = {SG_INVALID_ID};
+
+static bool g_stairs_active = false;
+static HMM_Vec3 g_stairs_pos;
+
+// --- Fade transition state ---
+enum FadeState { FADE_NONE, FADE_OUT, FADE_IN };
+static FadeState g_fade_state = FADE_NONE;
+static float g_fade_alpha = 0.0f;
+static const float FADE_SPEED = 2.0f; // 0.5 seconds per phase
+static sg_buffer g_fade_vbuf = {
+    SG_INVALID_ID};             // Buffer dedicado para el overlay fade
+static bool g_game_won = false; // Pantalla de victoria
+
+// Puerta (quad texturizado en el hueco de la pared)
+static Mesh g_door_mesh;
+static sg_buffer g_door_inst_buf = {SG_INVALID_ID};
+static HMM_Mat4 g_door_transform;
+static bool g_door_needs_update =
+    false; // Flag para actualizar buffer en frame_cb
+static bool g_restart_pending = false; // Flag para diferir reinicio al frame_cb
+
+static int g_cyclop_count = 0;
+static int g_scolitex_count = 0;
+static int g_oculi_count = 0;
+
+static int g_collected_count = 0; // Total aliens capturados en el nivel actual
+static int g_total_aliens = 0;    // Total aliens en el nivel actual
+
 static sg_sampler g_sampler;
 static sg_view g_dummy_white_view;
 static sg_view g_dummy_black_view;
@@ -40,6 +82,17 @@ static sg_image g_dummy_white_img;
 static sg_image g_dummy_black_img;
 static sg_image g_dummy_normal_img;
 static sg_image g_dummy_orm_img;
+
+// Datos para el minimapa 2D
+struct MinimapVertex {
+  float x, y;       // posición en NDC
+  float r, g, b, a; // color
+};
+
+static sg_buffer g_minimap_vbuf;
+static sg_pipeline g_minimap_pip;
+static sg_shader g_minimap_shader;
+static const int MAX_MINIMAP_VERTS = 6 * 64 * 64; // 6 vértices por celda
 
 struct TextureGroup {
   sg_image diffuse_img;
@@ -68,17 +121,18 @@ struct TextureGroup {
   }
 };
 
-#include <map>
 static std::map<std::string, TextureGroup> g_floor_groups;
 
-// Genera un quad plano de 4x4 unidades (centrado en el origen, Y=0)
+// Genera un quad plano de 4x4 unidades (centrado en el origen, ligeramente por
+// debajo de Y=0 para solaparse con la base de las paredes)
 static void create_floor_quad(Mesh &out_mesh, const std::string &tex_path) {
   float half = 2.0f; // 4x4 tile => half-extent = 2
+  float y = -0.02f;  // pequeño solapado bajo las paredes
   Vertex verts[4] = {
-      {HMM_V3(-half, 0, -half), HMM_V3(0, 1, 0), HMM_V2(0, 0)},
-      {HMM_V3(half, 0, -half), HMM_V3(0, 1, 0), HMM_V2(1, 0)},
-      {HMM_V3(half, 0, half), HMM_V3(0, 1, 0), HMM_V2(1, 1)},
-      {HMM_V3(-half, 0, half), HMM_V3(0, 1, 0), HMM_V2(0, 1)},
+      {HMM_V3(-half, y, -half), HMM_V3(0, 1, 0), HMM_V2(0, 0)},
+      {HMM_V3(half, y, -half), HMM_V3(0, 1, 0), HMM_V2(1, 0)},
+      {HMM_V3(half, y, half), HMM_V3(0, 1, 0), HMM_V2(1, 1)},
+      {HMM_V3(-half, y, half), HMM_V3(0, 1, 0), HMM_V2(0, 1)},
   };
   uint32_t idxs[6] = {0, 1, 2, 0, 2, 3};
 
@@ -96,6 +150,335 @@ static void create_floor_quad(Mesh &out_mesh, const std::string &tex_path) {
 
   // Cargar textura difusa y todos los mapas complementarios
   load_textures(tex_path, out_mesh);
+}
+
+static HMM_Vec2 world_to_map(HMM_Vec3 pos, float cw) {
+  // Conversión inversa: cx = -(y+0.5)*cw  ==> y = (-cx/cw)-0.5
+  // cz = (x+0.5)*cw ==> x = (cz/cw)-0.5
+  float grid_y = (-pos.X / cw) - 0.5f;
+  float grid_x = (pos.Z / cw) - 0.5f;
+  return HMM_V2(grid_x, grid_y); // Returns (col, row)
+}
+
+static void build_level_geometry(int lvl) {
+  // Limpiar geometrías previas
+  if (g_inst_buf.id != SG_INVALID_ID) {
+    sg_destroy_buffer(g_inst_buf);
+    g_inst_buf.id = SG_INVALID_ID;
+  }
+  // Nota: NO destruimos los buffers dinámicos de aliens aquí.
+  // Son buffers dinámicos gestionados por frame_cb / init_cb.
+
+  for (auto &it : g_floor_groups) {
+    if (it.second.inst_buf.id != SG_INVALID_ID) {
+      sg_destroy_buffer(it.second.inst_buf);
+      it.second.inst_buf.id = SG_INVALID_ID;
+    }
+    it.second.instances.clear();
+    it.second.num_instances = 0;
+  }
+
+  std::vector<HMM_Mat4> wall_instances;
+  int **matrix = g_config.levels[lvl].map->get_matrix();
+  int size = g_config.levels[lvl].map->get_size();
+  float cw = 4.0f;
+
+  std::vector<std::vector<bool>> visited(size, std::vector<bool>(size, false));
+
+  // Primero: Procesar todas las áreas (salas y pasillos) para el suelo
+  for (int i = 0; i < g_config.levels[lvl].map->room_count; i++) {
+    Room &r = g_config.levels[lvl].map->rooms[i];
+
+    char id_str[4];
+    snprintf(id_str, sizeof(id_str), "%02d", r.texture.id);
+    std::string tex_key =
+        r.texture.base + "/" + r.texture.base + "_" + id_str + "-512x512.png";
+    std::string tex_path = "assets/textures_id_bind/" + tex_key;
+
+    if (g_floor_groups.find(tex_key) == g_floor_groups.end()) {
+      TextureGroup tg;
+      tg.diffuse_img = g_dummy_white_img;
+      tg.diffuse_view = g_dummy_white_view;
+      tg.normal_img = g_dummy_normal_img;
+      tg.normal_view = g_dummy_normal_view;
+      tg.orm_img = g_dummy_orm_img;
+      tg.orm_view = g_dummy_orm_view;
+      tg.emissive_img = g_dummy_black_img;
+      tg.emissive_view = g_dummy_black_view;
+
+      Mesh dummy_mesh = {};
+      load_textures(tex_path, dummy_mesh);
+      if (dummy_mesh.diffuse_img.id != SG_INVALID_ID) {
+        tg.diffuse_img = dummy_mesh.diffuse_img;
+        tg.diffuse_view = dummy_mesh.diffuse_view;
+        if (dummy_mesh.normal_view.id != SG_INVALID_ID) {
+          tg.normal_img = dummy_mesh.normal_img;
+          tg.normal_view = dummy_mesh.normal_view;
+        }
+        if (dummy_mesh.orm_view.id != SG_INVALID_ID) {
+          tg.orm_img = dummy_mesh.orm_img;
+          tg.orm_view = dummy_mesh.orm_view;
+        }
+        if (dummy_mesh.emissive_view.id != SG_INVALID_ID) {
+          tg.emissive_img = dummy_mesh.emissive_img;
+          tg.emissive_view = dummy_mesh.emissive_view;
+        }
+      }
+      g_floor_groups[tex_key] = tg;
+    }
+
+    TextureGroup &group = g_floor_groups[tex_key];
+    for (int ry = r.y; ry < r.y + r.h; ry++) {
+      for (int rx = r.x; rx < r.x + r.w; rx++) {
+        if (ry >= 0 && ry < size && rx >= 0 && rx < size) {
+          if (!visited[ry][rx]) {
+            visited[ry][rx] = true;
+            HMM_Mat4 tf = HMM_Translate(HMM_V3(-ry * cw, 0.0f, rx * cw));
+            group.instances.push_back(tf);
+          }
+          static const int dy[4] = {-1, 1, 0, 0};
+          static const int dx[4] = {0, 0, -1, 1};
+          for (int d = 0; d < 4; d++) {
+            int ny = ry + dy[d];
+            int nx = rx + dx[d];
+            if (ny >= 0 && ny < size && nx >= 0 && nx < size) {
+              if (matrix[ny][nx] == 0 && !visited[ny][nx]) {
+                visited[ny][nx] = true;
+                HMM_Mat4 tf_wall_floor =
+                    HMM_Translate(HMM_V3(-ny * cw, 0.0f, nx * cw));
+                group.instances.push_back(tf_wall_floor);
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Segundo: Paredes y Esquinas
+  const HMM_Mat4 wall_offset = HMM_Translate(HMM_V3(-0.44f, 0.0f, 0.0f));
+  for (int z = 0; z < size; z++) {
+    for (int x = 0; x < size; x++) {
+      if (matrix[z][x] != 0 &&
+          matrix[z][x] != 99) { // Es navegable (espacio abierto)
+        float cx = -z * cw;
+        float cz = x * cw;
+        HMM_Mat4 tf = HMM_Translate(HMM_V3(cx, -0.02f, cz));
+
+        // Colocar muros: se pone pared si el vecino es 0 (muro) O 99 (puerta).
+        // Para 99, ADEMÁS se superpone la textura de puerta encima del muro.
+        auto is_wall = [&](int gz, int gx) -> bool {
+          if (gz < 0 || gz >= size || gx < 0 || gx >= size)
+            return true;
+          return matrix[gz][gx] == 0 || matrix[gz][gx] == 99;
+        };
+
+        // Sur (z+1)
+        if (is_wall(z + 1, x)) {
+          wall_instances.push_back(HMM_MulM4(tf, wall_offset));
+          if (z < size - 1 && matrix[z + 1][x] == 99) {
+            // Puerta superpuesta: ligeramente delante del muro (+0.4 hacia el
+            // room = +X)
+            HMM_Mat4 fmove =
+                HMM_Translate(HMM_V3(-(z + 0.5f) * cw + 0.4f, 0.0f, x * cw));
+            HMM_Mat4 rot = HMM_Rotate_RH(HMM_AngleDeg(90.0f), HMM_V3(0, 1, 0));
+            g_door_transform = HMM_MulM4(fmove, rot);
+            g_door_needs_update = true;
+          }
+        }
+        // Norte (z-1)
+        if (is_wall(z - 1, x)) {
+          HMM_Mat4 rot = HMM_Rotate_RH(HMM_AngleDeg(180.0f), HMM_V3(0, 1, 0));
+          wall_instances.push_back(HMM_MulM4(tf, HMM_MulM4(rot, wall_offset)));
+          if (z > 0 && matrix[z - 1][x] == 99) {
+            HMM_Mat4 fmove =
+                HMM_Translate(HMM_V3(-(z - 0.5f) * cw - 0.4f, 0.0f, x * cw));
+            HMM_Mat4 rr = HMM_Rotate_RH(HMM_AngleDeg(-90.0f), HMM_V3(0, 1, 0));
+            g_door_transform = HMM_MulM4(fmove, rr);
+            g_door_needs_update = true;
+          }
+        }
+        // Oeste (x-1)
+        if (is_wall(z, x - 1)) {
+          HMM_Mat4 rot = HMM_Rotate_RH(HMM_AngleDeg(-90.0f), HMM_V3(0, 1, 0));
+          wall_instances.push_back(HMM_MulM4(tf, HMM_MulM4(rot, wall_offset)));
+          if (x > 0 && matrix[z][x - 1] == 99) {
+            HMM_Mat4 fmove =
+                HMM_Translate(HMM_V3(-z * cw, 0.0f, (x - 0.5f) * cw + 0.4f));
+            g_door_transform = fmove;
+            g_door_needs_update = true;
+          }
+        }
+        // Este (x+1)
+        if (is_wall(z, x + 1)) {
+          HMM_Mat4 rot = HMM_Rotate_RH(HMM_AngleDeg(90.0f), HMM_V3(0, 1, 0));
+          wall_instances.push_back(HMM_MulM4(tf, HMM_MulM4(rot, wall_offset)));
+          if (x < size - 1 && matrix[z][x + 1] == 99) {
+            HMM_Mat4 fmove =
+                HMM_Translate(HMM_V3(-z * cw, 0.0f, (x + 0.5f) * cw - 0.4f));
+            HMM_Mat4 rr = HMM_Rotate_RH(HMM_AngleDeg(180.0f), HMM_V3(0, 1, 0));
+            g_door_transform = HMM_MulM4(fmove, rr);
+            g_door_needs_update = true;
+          }
+        }
+      } else if (matrix[z][x] == 99) { // Es puerta
+        g_stairs_active = true;
+        g_stairs_pos = HMM_V3(-(z + 0.5f) * cw, 0.0f, (x + 0.5f) * cw);
+      }
+    }
+  }
+
+  for (int z = 0; z < size; z++) {
+    for (int x = 0; x < size; x++) {
+      if (matrix[z][x] == 0 || matrix[z][x] == 99)
+        continue; // Pared o escalera
+
+      int north = (z > 0) ? matrix[z - 1][x] : 0;
+      int south = (z < size - 1) ? matrix[z + 1][x] : 0;
+      int west = (x > 0) ? matrix[z][x - 1] : 0;
+      int east = (x < size - 1) ? matrix[z][x + 1] : 0;
+
+      float cx_corner = -z * cw;
+      float cz_corner = x * cw;
+      float c_off = 0.4595f;
+
+      if (north == 0 && east == 0) {
+        float cx = cx_corner + c_off;
+        float cz = cz_corner + c_off;
+        HMM_Mat4 tf_corner = HMM_Translate(HMM_V3(cx, -0.02f, cz));
+        HMM_Mat4 rot = HMM_Rotate_RH(HMM_AngleDeg(135.0f), HMM_V3(0, 1, 0));
+        wall_instances.push_back(
+            HMM_MulM4(tf_corner, HMM_MulM4(rot, wall_offset)));
+      }
+      if (north == 0 && west == 0) {
+        float cx = cx_corner + c_off;
+        float cz = cz_corner - c_off;
+        HMM_Mat4 tf_corner = HMM_Translate(HMM_V3(cx, -0.02f, cz));
+        HMM_Mat4 rot = HMM_Rotate_RH(HMM_AngleDeg(-135.0f), HMM_V3(0, 1, 0));
+        wall_instances.push_back(
+            HMM_MulM4(tf_corner, HMM_MulM4(rot, wall_offset)));
+      }
+      if (south == 0 && east == 0) {
+        float cx = cx_corner - c_off;
+        float cz = cz_corner + c_off;
+        HMM_Mat4 tf_corner = HMM_Translate(HMM_V3(cx, -0.02f, cz));
+        HMM_Mat4 rot = HMM_Rotate_RH(HMM_AngleDeg(45.0f), HMM_V3(0, 1, 0));
+        wall_instances.push_back(
+            HMM_MulM4(tf_corner, HMM_MulM4(rot, wall_offset)));
+      }
+      if (south == 0 && west == 0) {
+        float cx = cx_corner - c_off;
+        float cz = cz_corner - c_off;
+        HMM_Mat4 tf_corner = HMM_Translate(HMM_V3(cx, -0.02f, cz));
+        HMM_Mat4 rot = HMM_Rotate_RH(HMM_AngleDeg(-45.0f), HMM_V3(0, 1, 0));
+        wall_instances.push_back(
+            HMM_MulM4(tf_corner, HMM_MulM4(rot, wall_offset)));
+      }
+    }
+  }
+
+  if (wall_instances.empty()) {
+    wall_instances.push_back(HMM_Scale(HMM_V3(0.0f, 0.0f, 0.0f)));
+  }
+
+  g_num_instances = (int)wall_instances.size();
+  sg_buffer_desc inst_desc = {};
+  inst_desc.usage.vertex_buffer = true;
+  inst_desc.data = {wall_instances.data(),
+                    wall_instances.size() * sizeof(HMM_Mat4)};
+  g_inst_buf = sg_make_buffer(&inst_desc);
+
+  for (auto &it : g_floor_groups) {
+    if (it.second.instances.empty())
+      continue;
+    it.second.num_instances = (int)it.second.instances.size();
+    sg_buffer_desc f_inst_desc = {};
+    f_inst_desc.usage.vertex_buffer = true;
+    f_inst_desc.data = {it.second.instances.data(),
+                        it.second.instances.size() * sizeof(HMM_Mat4)};
+    it.second.inst_buf = sg_make_buffer(&f_inst_desc);
+  }
+
+  // --- Parsear items collectables y crear sus buffers instanciados ---
+  std::vector<HMM_Mat4> cyclop_inst;
+  std::vector<HMM_Mat4> scolitex_inst;
+  std::vector<HMM_Mat4> oculi_inst;
+  g_total_aliens = g_config.collectable_count[lvl];
+
+  // Guardar el valor real de g_collected_count para no reiniciarlo
+  int real_collected_count = g_collected_count;
+  g_collected_count = 0;
+
+  for (int i = 0; i < g_total_aliens; i++) {
+    Collectable &c = g_config.collectables[lvl][i];
+
+    // Si la textura (alien ID) es -1, significa que ya fue capturado y no se
+    // dibuja ni calcula
+    if (c.texture_id == -1)
+      continue;
+
+    // La matriz del mapa se lee con índices z=fila, x=col.
+    // En el mundo 3D: el eje X va de positivo a negativo (filas z)
+    // y el eje Z va de negativo a positivo (columnas x).
+    // Las salas colocan paredes centradas, así que los aliens también van en el
+    // centro de su baldosa
+    float cx = -(c.y + 0.5f) * cw;
+    float cz = (c.x + 0.5f) * cw;
+    HMM_Vec3 alien_pos = HMM_V3(cx, 0.0f, cz);
+
+    // Check de colisión por AABB (Axis-Aligned Bounding Box)
+    // Asumimos un radio/ancho y profundidad aproximado para el alien escalado
+    // (ej: 0.8 unids)
+    float aabb_hx = 0.8f;
+    float aabb_hz = 0.8f;
+    // Y la cámara representa al jugador con cierto grosor (ej: 0.3 unids)
+    float cam_hx = 0.3f;
+    float cam_hz = 0.3f;
+
+    // Verificamos solapamiento en el eje X y Z
+    bool overlap_x = (g_camera.position.X + cam_hx >= alien_pos.X - aabb_hx) &&
+                     (g_camera.position.X - cam_hx <= alien_pos.X + aabb_hx);
+    bool overlap_z = (g_camera.position.Z + cam_hz >= alien_pos.Z - aabb_hz) &&
+                     (g_camera.position.Z - cam_hz <= alien_pos.Z + aabb_hz);
+
+    if (overlap_x && overlap_z) {
+      c.texture_id = -1; // Marcar como recolectado
+      g_collected_count++;
+      continue;
+    }
+
+    // Escala menor (0.25f) para que no sean gigantes y obstaculicen las paredes
+    HMM_Mat4 scale = HMM_Scale(HMM_V3(0.25f, 0.25f, 0.25f));
+    HMM_Mat4 move = HMM_Translate(alien_pos);
+    HMM_Mat4 rot =
+        HMM_Rotate_RH(HMM_AngleDeg(c.x * c.y * 30.0f),
+                      HMM_V3(0, 1, 0)); // Rotación pseudoaleatoria estable
+    HMM_Mat4 tf = HMM_MulM4(move, HMM_MulM4(rot, scale));
+
+    if (c.texture_id == 100)
+      cyclop_inst.push_back(tf);
+    else if (c.texture_id == 101)
+      scolitex_inst.push_back(tf);
+    else
+      oculi_inst.push_back(tf);
+  }
+
+  auto update_dynamic_buf = [](sg_buffer buf,
+                               const std::vector<HMM_Mat4> &inst) {
+    if (!inst.empty()) {
+      sg_update_buffer(buf, {inst.data(), inst.size() * sizeof(HMM_Mat4)});
+    }
+  };
+
+  g_cyclop_count = cyclop_inst.size();
+  g_scolitex_count = scolitex_inst.size();
+  g_oculi_count = oculi_inst.size();
+  update_dynamic_buf(g_alien_cyclop_inst_buf, cyclop_inst);
+  update_dynamic_buf(g_alien_scolitex_inst_buf, scolitex_inst);
+  update_dynamic_buf(g_alien_oculi_inst_buf, oculi_inst);
+
+  // Restaurar el valor real
+  g_collected_count = real_collected_count;
 }
 
 // Callback: se ejecuta una vez al iniciar la aplicación
@@ -186,128 +569,79 @@ static void init_cb(void) {
     printf("Error cargando pared %s\n", obj_path.c_str());
   }
 
-  // Generar quad plano para el suelo (evita discontinuidades del OBJ)
-  // Nota: Ya no cargamos una sola textura para el suelo, se hará por grupo.
-  create_floor_quad(g_floor_mesh, ""); // "" indica que no cargue texturas aquí
-
-  // Generar instancias de la pared y suelo según el mapa
-  std::vector<HMM_Mat4> wall_instances;
-  int **matrix = g_config.levels[lvl].map->get_matrix();
-  int size = g_config.levels[lvl].map->get_size();
-  float cw = 4.0f;
-
-  // Visitados para no duplicar suelo
-  std::vector<std::vector<bool>> visited(size, std::vector<bool>(size, false));
-
-  // Primero: Procesar todas las áreas (salas y pasillos) para el suelo
-  for (int i = 0; i < g_config.levels[lvl].map->room_count; i++) {
-    Room &r = g_config.levels[lvl].map->rooms[i];
-
-    char id_str[4];
-    snprintf(id_str, sizeof(id_str), "%02d", r.texture.id);
-    std::string tex_key =
-        r.texture.base + "/" + r.texture.base + "_" + id_str + "-512x512.png";
-    std::string tex_path = "assets/textures_id_bind/" + tex_key;
-
-    if (g_floor_groups.find(tex_key) == g_floor_groups.end()) {
-      TextureGroup tg;
-      // Inicializar con dummies por si acaso
-      tg.diffuse_img = g_dummy_white_img;
-      tg.diffuse_view = g_dummy_white_view;
-      tg.normal_img = g_dummy_normal_img;
-      tg.normal_view = g_dummy_normal_view;
-      tg.orm_img = g_dummy_orm_img;
-      tg.orm_view = g_dummy_orm_view;
-      tg.emissive_img = g_dummy_black_img;
-      tg.emissive_view = g_dummy_black_view;
-
-      // Intentar cargar
-      Mesh dummy_mesh = {};
-      load_textures(tex_path, dummy_mesh);
-      if (dummy_mesh.diffuse_img.id != SG_INVALID_ID) {
-        tg.diffuse_img = dummy_mesh.diffuse_img;
-        tg.diffuse_view = dummy_mesh.diffuse_view;
-        if (dummy_mesh.normal_view.id != SG_INVALID_ID) {
-          tg.normal_img = dummy_mesh.normal_img;
-          tg.normal_view = dummy_mesh.normal_view;
-        }
-        if (dummy_mesh.orm_view.id != SG_INVALID_ID) {
-          tg.orm_img = dummy_mesh.orm_img;
-          tg.orm_view = dummy_mesh.orm_view;
-        }
-        if (dummy_mesh.emissive_view.id != SG_INVALID_ID) {
-          tg.emissive_img = dummy_mesh.emissive_img;
-          tg.emissive_view = dummy_mesh.emissive_view;
-        }
-      }
-      g_floor_groups[tex_key] = tg;
-    }
-
-    TextureGroup &group = g_floor_groups[tex_key];
-    for (int ry = r.y; ry < r.y + r.h; ry++) {
-      for (int rx = r.x; rx < r.x + r.w; rx++) {
-        if (ry >= 0 && ry < size && rx >= 0 && rx < size) {
-          if (!visited[ry][rx]) {
-            visited[ry][rx] = true;
-            HMM_Mat4 tf = HMM_Translate(HMM_V3(-ry * cw, 0.0f, rx * cw));
-            group.instances.push_back(tf);
-          }
-        }
-      }
-    }
+  // Cargar modelos 3D de los aliens (collectables)
+  // Nota: Las texturas pueden no existir como basecolor per-se, usamos blanca o
+  // por defecto.
+  if (!load_obj("assets/scifi/OBJ/Aliens/Alien_Cyclop.obj", "",
+                g_alien_cyclop_mesh)) {
+    printf("Error cargando Alien_Cyclop\n");
+  }
+  if (!load_obj("assets/scifi/OBJ/Aliens/Alien_Scolitex.obj", "",
+                g_alien_scolitex_mesh)) {
+    printf("Error cargando Alien_Scolitex\n");
+  }
+  if (!load_obj("assets/scifi/OBJ/Aliens/Alien_Oculichrysalis.obj", "",
+                g_alien_oculi_mesh)) {
+    printf("Error cargando Alien_Oculichrysalis\n");
   }
 
-  // Segundo: Procesar paredes basándose en la matriz
-  for (int z = 0; z < size; z++) {
-    for (int x = 0; x < size; x++) {
-      if (matrix[z][x] != 0) {
-        float cx = -z * cw;
-        float cz = x * cw;
-        HMM_Mat4 tf = HMM_Translate(HMM_V3(cx, 0.0f, cz));
-        HMM_Mat4 wall_offset = HMM_Translate(HMM_V3(-0.44f, 0.0f, 0.0f));
+  create_floor_quad(g_floor_mesh, "");
 
-        if (z == size - 1 || matrix[z + 1][x] == 0) {
-          wall_instances.push_back(HMM_MulM4(tf, wall_offset));
-        }
-        if (z == 0 || matrix[z - 1][x] == 0) {
-          HMM_Mat4 rot = HMM_Rotate_RH(HMM_AngleDeg(180.0f), HMM_V3(0, 1, 0));
-          wall_instances.push_back(HMM_MulM4(tf, HMM_MulM4(rot, wall_offset)));
-        }
-        if (x == 0 || matrix[z][x - 1] == 0) {
-          HMM_Mat4 rot = HMM_Rotate_RH(HMM_AngleDeg(-90.0f), HMM_V3(0, 1, 0));
-          wall_instances.push_back(HMM_MulM4(tf, HMM_MulM4(rot, wall_offset)));
-        }
-        if (x == size - 1 || matrix[z][x + 1] == 0) {
-          HMM_Mat4 rot = HMM_Rotate_RH(HMM_AngleDeg(90.0f), HMM_V3(0, 1, 0));
-          wall_instances.push_back(HMM_MulM4(tf, HMM_MulM4(rot, wall_offset)));
-        }
-      }
-    }
+  // Crear quad para la puerta (un plano vertical de 4x4 con textura)
+  {
+    float half = 2.0f;
+    // UVs mapeados para que la textura no se repita y se vea de frente.
+    // Asumiendo que bottom-left es (0,1) o (0,0) dependiendo de la carga de
+    // imagen. Sokol gfx con stb_image suele tener (0,0) top-left.
+    Vertex door_verts[4] = {
+        {HMM_V3(-half, 0, 0), HMM_V3(0, 0, 1), HMM_V2(0, 1)}, // Bottom-left
+        {HMM_V3(half, 0, 0), HMM_V3(0, 0, 1), HMM_V2(1, 1)},  // Bottom-right
+        {HMM_V3(half, half * 2, 0), HMM_V3(0, 0, 1), HMM_V2(1, 0)}, // Top-right
+        {HMM_V3(-half, half * 2, 0), HMM_V3(0, 0, 1), HMM_V2(0, 0)}, // Top-left
+    };
+    uint32_t door_idxs[6] = {0, 1, 2, 0, 2, 3};
+    g_door_mesh.num_indices = 6;
+    sg_buffer_desc vb = {};
+    vb.usage.vertex_buffer = true;
+    vb.data = {door_verts, sizeof(door_verts)};
+    g_door_mesh.vbuf = sg_make_buffer(&vb);
+    sg_buffer_desc ib = {};
+    ib.usage.index_buffer = true;
+    ib.data = {door_idxs, sizeof(door_idxs)};
+    g_door_mesh.ibuf = sg_make_buffer(&ib);
+    load_textures("assets/doors/door1.png", g_door_mesh);
+  }
+  // Buffer de instancia para la puerta (1 sola instancia, dinámico)
+  {
+    sg_buffer_desc dd = {};
+    dd.usage.vertex_buffer = true;
+    dd.usage.dynamic_update = true;
+    dd.size = sizeof(HMM_Mat4);
+    g_door_inst_buf = sg_make_buffer(&dd);
   }
 
-  if (wall_instances.empty()) {
-    wall_instances.push_back(HMM_Scale(HMM_V3(0.0f, 0.0f, 0.0f)));
-  }
+  // Construir geometría modular (suelos y paredes)
+  build_level_geometry(lvl);
 
-  g_num_instances = (int)wall_instances.size();
+  // --- Inicializar Buffers Dinámicos para Aliens ---
+  auto make_dynamic_buf = [](int max_elements) -> sg_buffer {
+    sg_buffer_desc desc = {};
+    desc.usage.vertex_buffer = true;
+    desc.usage.dynamic_update = true;
+    desc.size = max_elements * sizeof(HMM_Mat4);
+    return sg_make_buffer(&desc);
+  };
+  g_alien_cyclop_inst_buf = make_dynamic_buf(30);
+  g_alien_scolitex_inst_buf = make_dynamic_buf(30);
+  g_alien_oculi_inst_buf = make_dynamic_buf(30);
 
-  // Buffer de instanciación para paredes
-  sg_buffer_desc inst_desc = {};
-  inst_desc.usage.vertex_buffer = true;
-  inst_desc.data = {wall_instances.data(),
-                    wall_instances.size() * sizeof(HMM_Mat4)};
-  g_inst_buf = sg_make_buffer(&inst_desc);
-
-  // Crear buffers de instanciación para cada grupo de suelo
-  for (auto &it : g_floor_groups) {
-    if (it.second.instances.empty())
-      continue;
-    it.second.num_instances = (int)it.second.instances.size();
-    sg_buffer_desc f_inst_desc = {};
-    f_inst_desc.usage.vertex_buffer = true;
-    f_inst_desc.data = {it.second.instances.data(),
-                        it.second.instances.size() * sizeof(HMM_Mat4)};
-    it.second.inst_buf = sg_make_buffer(&f_inst_desc);
+  // Buffer dedicado para el overlay de fade (6 vértices)
+  {
+    sg_buffer_desc fd = {};
+    fd.usage.vertex_buffer = true;
+    fd.usage.dynamic_update = true;
+    fd.size = 6 * sizeof(MinimapVertex);
+    g_fade_vbuf = sg_make_buffer(&fd);
   }
 
   // Crear Sampler genérico
@@ -350,6 +684,56 @@ static void init_cb(void) {
 
   g_pip = sg_make_pipeline(&pip_desc);
 
+  // --- Pipeline y recursos para el minimapa 2D ---
+  const char *mm_vs_src = R"(
+#version 330
+layout(location=0) in vec2 pos;
+layout(location=1) in vec4 color;
+out vec4 v_color;
+void main() {
+    gl_Position = vec4(pos, 0.0, 1.0);
+    v_color = color;
+}
+)";
+
+  const char *mm_fs_src = R"(
+#version 330
+in vec4 v_color;
+out vec4 frag_color;
+void main() {
+    frag_color = v_color;
+}
+)";
+
+  sg_shader_desc mm_shd_desc = {};
+  mm_shd_desc.vertex_func.source = mm_vs_src;
+  mm_shd_desc.fragment_func.source = mm_fs_src;
+  g_minimap_shader = sg_make_shader(&mm_shd_desc);
+
+  sg_pipeline_desc mm_pip_desc = {};
+  mm_pip_desc.shader = g_minimap_shader;
+  mm_pip_desc.layout.attrs[0].format = SG_VERTEXFORMAT_FLOAT2; // pos
+  mm_pip_desc.layout.attrs[1].format = SG_VERTEXFORMAT_FLOAT4; // color
+  mm_pip_desc.primitive_type = SG_PRIMITIVETYPE_TRIANGLES;
+  mm_pip_desc.depth.write_enabled = false;
+  mm_pip_desc.depth.compare = SG_COMPAREFUNC_ALWAYS;
+  mm_pip_desc.colors[0].blend.enabled = true;
+  mm_pip_desc.colors[0].blend.src_factor_rgb = SG_BLENDFACTOR_SRC_ALPHA;
+  mm_pip_desc.colors[0].blend.dst_factor_rgb =
+      SG_BLENDFACTOR_ONE_MINUS_SRC_ALPHA;
+
+  g_minimap_pip = sg_make_pipeline(&mm_pip_desc);
+
+  sg_buffer_desc mm_buf_desc = {};
+  // Buffer de vértices actualizable en cada frame
+  mm_buf_desc.size = sizeof(MinimapVertex) * MAX_MINIMAP_VERTS;
+  mm_buf_desc.usage.vertex_buffer = true;
+  mm_buf_desc.usage.dynamic_update = true;
+  // Para buffers dinámicos no se debe pasar data inicial
+  mm_buf_desc.data.ptr = nullptr;
+  mm_buf_desc.data.size = 0;
+  g_minimap_vbuf = sg_make_buffer(&mm_buf_desc);
+
   last_time = stm_now();
 }
 
@@ -358,35 +742,69 @@ static void frame_cb(void) {
   float dt = (float)stm_sec(stm_diff(stm_now(), last_time));
   last_time = stm_now();
 
-  // Movimiento de jugador: W, A, S, D en el plano ZX
-  float speed = 20.0f * dt;
+  // --- Manejar reinicio pendiente (diferido desde event_cb) ---
+  if (g_restart_pending) {
+    g_restart_pending = false;
+    g_game_won = false;
+    g_config.current_level = GameConfig::START_LEVEL;
+    g_stairs_active = false;
+    g_total_aliens = g_config.collectable_count[g_config.current_level];
+    g_collected_count = 0;
+    g_fade_state = FADE_NONE;
+    g_fade_alpha = 0.0f;
+    g_door_needs_update = false;
 
-  // Extraer vectores directores solo en plano XZ y normalizarlos
-  HMM_Vec3 move_forward = HMM_V3(g_camera.forward.X, 0.0f, g_camera.forward.Z);
-  if (HMM_LenV3(move_forward) > 0.001f) {
-    move_forward = HMM_NormV3(move_forward);
+    for (int l = 0; l < 3; l++) {
+      for (int i = 0; i < g_config.collectable_count[l]; i++) {
+        g_config.collectables[l][i].texture_id = 100 + (i % 3);
+      }
+    }
+
+    build_level_geometry(g_config.current_level);
+
+    float cw = 4.0f;
+    int lvl_r = g_config.current_level;
+    int start_room_idx = rand() % g_config.levels[lvl_r].map->room_count;
+    Room start_room = g_config.levels[lvl_r].map->rooms[start_room_idx];
+    g_camera.position =
+        HMM_V3(-start_room.center_y() * cw, 1.0f, start_room.center_x() * cw);
+    g_camera.yaw = 180.0f;
+    g_camera.update_vectors();
+    sapp_lock_mouse(true);
   }
 
-  HMM_Vec3 move_right = HMM_V3(g_camera.right.X, 0.0f, g_camera.right.Z);
-  if (HMM_LenV3(move_right) > 0.001f) {
-    move_right = HMM_NormV3(move_right);
-  }
+  // Movimiento de jugador: solo si no hay fade transition
+  if (g_fade_state == FADE_NONE) {
+    float speed = 20.0f * dt;
 
-  if (g_input.keys[SAPP_KEYCODE_W]) {
-    g_camera.position =
-        HMM_AddV3(g_camera.position, HMM_MulV3F(move_forward, speed));
-  }
-  if (g_input.keys[SAPP_KEYCODE_S]) {
-    g_camera.position =
-        HMM_SubV3(g_camera.position, HMM_MulV3F(move_forward, speed));
-  }
-  if (g_input.keys[SAPP_KEYCODE_A]) {
-    g_camera.position =
-        HMM_SubV3(g_camera.position, HMM_MulV3F(move_right, speed));
-  }
-  if (g_input.keys[SAPP_KEYCODE_D]) {
-    g_camera.position =
-        HMM_AddV3(g_camera.position, HMM_MulV3F(move_right, speed));
+    // Extraer vectores directores solo en plano XZ y normalizarlos
+    HMM_Vec3 move_forward =
+        HMM_V3(g_camera.forward.X, 0.0f, g_camera.forward.Z);
+    if (HMM_LenV3(move_forward) > 0.001f) {
+      move_forward = HMM_NormV3(move_forward);
+    }
+
+    HMM_Vec3 move_right = HMM_V3(g_camera.right.X, 0.0f, g_camera.right.Z);
+    if (HMM_LenV3(move_right) > 0.001f) {
+      move_right = HMM_NormV3(move_right);
+    }
+
+    if (g_input.keys[SAPP_KEYCODE_W]) {
+      g_camera.position =
+          HMM_AddV3(g_camera.position, HMM_MulV3F(move_forward, speed));
+    }
+    if (g_input.keys[SAPP_KEYCODE_S]) {
+      g_camera.position =
+          HMM_SubV3(g_camera.position, HMM_MulV3F(move_forward, speed));
+    }
+    if (g_input.keys[SAPP_KEYCODE_A]) {
+      g_camera.position =
+          HMM_SubV3(g_camera.position, HMM_MulV3F(move_right, speed));
+    }
+    if (g_input.keys[SAPP_KEYCODE_D]) {
+      g_camera.position =
+          HMM_AddV3(g_camera.position, HMM_MulV3F(move_right, speed));
+    }
   }
 
   // --- Collision Detection & Resolution ---
@@ -431,6 +849,196 @@ static void frame_cb(void) {
     }
   }
   // ----------------------------------------
+
+  if (!g_game_won) {
+    // --- AABB Collectables & Stairs Logic ---
+    float cw_3d = 4.0f;
+    std::vector<HMM_Mat4> cyclop_inst;
+    std::vector<HMM_Mat4> scolitex_inst;
+    std::vector<HMM_Mat4> oculi_inst;
+    int lvl = g_config.current_level;
+
+    for (int i = 0; i < g_total_aliens; i++) {
+      Collectable &c = g_config.collectables[lvl][i];
+      if (c.texture_id == -1)
+        continue;
+
+      float cx = -(c.y + 0.5f) * cw_3d;
+      float cz = (c.x + 0.5f) * cw_3d;
+      HMM_Vec3 alien_pos = HMM_V3(cx, 0.0f, cz);
+
+      // Check AABB
+      float aabb_hx = 0.8f;
+      float aabb_hz = 0.8f;
+      float cam_hx = 0.3f;
+      float cam_hz = 0.3f;
+      bool overlap_x =
+          (g_camera.position.X + cam_hx >= alien_pos.X - aabb_hx) &&
+          (g_camera.position.X - cam_hx <= alien_pos.X + aabb_hx);
+      bool overlap_z =
+          (g_camera.position.Z + cam_hz >= alien_pos.Z - aabb_hz) &&
+          (g_camera.position.Z - cam_hz <= alien_pos.Z + aabb_hz);
+
+      if (overlap_x && overlap_z) {
+        c.texture_id = -1; // Marcar como recolectado
+        g_collected_count++;
+
+        // Si capturamos el último alien y no hay escaleras activas, crearlas
+        if (g_collected_count == g_total_aliens && !g_stairs_active) {
+          int best_z = -1, best_x = -1;
+          float best_dist = 1e9f;
+          int **matrix_st = g_config.levels[lvl].map->get_matrix();
+          int size_st = g_config.levels[lvl].map->get_size();
+
+          // Buscar el muro MÁS CERCANO al jugador que tenga al menos
+          // un vecino navegable (para que el jugador pueda llegar hasta él).
+          for (int z = 0; z < size_st; z++) {
+            for (int x = 0; x < size_st; x++) {
+              if (matrix_st[z][x] != 0)
+                continue; // Solo muros (valor 0)
+
+              // Verificar que al menos un vecino ortogonal sea navegable
+              bool has_nav_neighbor = false;
+              const int dz4[4] = {-1, 1, 0, 0};
+              const int dx4[4] = {0, 0, -1, 1};
+              for (int d = 0; d < 4; d++) {
+                int nz = z + dz4[d], nx = x + dx4[d];
+                if (nz >= 0 && nz < size_st && nx >= 0 && nx < size_st &&
+                    matrix_st[nz][nx] != 0) {
+                  has_nav_neighbor = true;
+                  break;
+                }
+              }
+              if (!has_nav_neighbor)
+                continue;
+
+              HMM_Vec3 wall_pos =
+                  HMM_V3(-(z + 0.5f) * cw_3d, 0.0f, (x + 0.5f) * cw_3d);
+              float dist = HMM_LenV3(HMM_SubV3(wall_pos, g_camera.position));
+              if (dist < best_dist) {
+                best_dist = dist;
+                best_z = z;
+                best_x = x;
+              }
+            }
+          }
+          if (best_z != -1 && best_x != -1) {
+            matrix_st[best_z][best_x] = 99; // Marker de Escalera
+            g_stairs_active = true;
+            g_stairs_pos =
+                HMM_V3(-(best_z + 0.5f) * cw_3d, 0.0f, (best_x + 0.5f) * cw_3d);
+            build_level_geometry(lvl); // Reconstruir sin ese muro
+
+            printf("=== PUERTA GENERADA en celda [%d][%d], posición 3D (%.1f, "
+                   "%.1f) ===\n",
+                   best_z, best_x, g_stairs_pos.X, g_stairs_pos.Z);
+          } else {
+            printf("!!! ERROR: No se encontró muro adyacente a zona navegable "
+                   "!!!\n");
+          }
+        }
+        continue;
+      }
+
+      HMM_Mat4 scale = HMM_Scale(HMM_V3(0.25f, 0.25f, 0.25f));
+      HMM_Mat4 move = HMM_Translate(alien_pos);
+      HMM_Mat4 rot =
+          HMM_Rotate_RH(HMM_AngleDeg(c.x * c.y * 30.0f), HMM_V3(0, 1, 0));
+      HMM_Mat4 tf = HMM_MulM4(move, HMM_MulM4(rot, scale));
+
+      if (c.texture_id == 100)
+        cyclop_inst.push_back(tf);
+      else if (c.texture_id == 101)
+        scolitex_inst.push_back(tf);
+      else
+        oculi_inst.push_back(tf);
+    }
+
+    auto update_dynamic_buf = [](sg_buffer buf,
+                                 const std::vector<HMM_Mat4> &inst) {
+      if (!inst.empty()) {
+        sg_update_buffer(buf, {inst.data(), inst.size() * sizeof(HMM_Mat4)});
+      }
+    };
+    g_cyclop_count = cyclop_inst.size();
+    g_scolitex_count = scolitex_inst.size();
+    g_oculi_count = oculi_inst.size();
+    update_dynamic_buf(g_alien_cyclop_inst_buf, cyclop_inst);
+    update_dynamic_buf(g_alien_scolitex_inst_buf, scolitex_inst);
+    update_dynamic_buf(g_alien_oculi_inst_buf, oculi_inst);
+
+    // Colision con la puerta — disparar fade al tocar el area de la puerta
+    if (g_stairs_active && g_fade_state == FADE_NONE) {
+      // Usar la posicion real de la cara de la puerta (de su matriz de
+      // transformación)
+      HMM_Vec3 face_pos = HMM_V3(g_door_transform.Elements[3][0],
+                                 g_door_transform.Elements[3][1],
+                                 g_door_transform.Elements[3][2]);
+
+      // AABB centrada en la puerta. Extensión de 1.5 unidades cubre el area de
+      // la textura (ancho 4 -> half 2) y profundidad de +-1.0 para detectar la
+      // colisión cerca.
+      float hx = 1.5f;
+      float hz = 1.5f;
+      bool overlap_x = (g_camera.position.X + 0.3f >= face_pos.X - hx) &&
+                       (g_camera.position.X - 0.3f <= face_pos.X + hx);
+      bool overlap_z = (g_camera.position.Z + 0.3f >= face_pos.Z - hz) &&
+                       (g_camera.position.Z - 0.3f <= face_pos.Z + hz);
+      if (overlap_x && overlap_z) {
+        g_fade_state = FADE_OUT;
+        g_fade_alpha = 0.0f;
+      }
+    }
+
+    // --- Fade state machine ---
+    if (g_fade_state == FADE_OUT) {
+      g_fade_alpha += FADE_SPEED * dt;
+      if (g_fade_alpha >= 1.0f) {
+        g_fade_alpha = 1.0f;
+
+        int next_level = g_config.current_level + 1;
+        if (next_level >= 3) {
+          // ¡Victoria! No hay más niveles
+          g_game_won = true;
+          g_fade_state = FADE_NONE;
+          g_fade_alpha = 0.0f;
+          g_stairs_active = false;
+          sapp_lock_mouse(
+              false); // Liberar el cursor para la pantalla de victoria
+        } else {
+          // Pantalla completamente negra → cambiar de nivel
+          g_config.current_level = next_level;
+          lvl = g_config.current_level;
+          g_stairs_active = false;
+          g_total_aliens = g_config.collectable_count[lvl];
+          g_collected_count = 0;
+
+          build_level_geometry(lvl);
+
+          int start_room_idx = rand() % g_config.levels[lvl].map->room_count;
+          Room start_room = g_config.levels[lvl].map->rooms[start_room_idx];
+          g_camera.position = HMM_V3(-start_room.center_y() * cw_3d, 1.0f,
+                                     start_room.center_x() * cw_3d);
+          g_camera.yaw = 180.0f;
+          g_camera.update_vectors();
+
+          g_fade_state = FADE_IN;
+        }
+      }
+    } else if (g_fade_state == FADE_IN) {
+      g_fade_alpha -= FADE_SPEED * dt;
+      if (g_fade_alpha <= 0.0f) {
+        g_fade_alpha = 0.0f;
+        g_fade_state = FADE_NONE;
+      }
+    }
+  } // end if (!g_game_won)
+
+  // Actualizar buffer de puerta si es necesario
+  if (g_door_needs_update) {
+    g_door_needs_update = false;
+    sg_update_buffer(g_door_inst_buf, {&g_door_transform, sizeof(HMM_Mat4)});
+  }
 
   // Generar las matrices MVP (View y Projection)
   HMM_Mat4 view = g_camera.get_view_matrix();
@@ -546,6 +1154,659 @@ static void frame_cb(void) {
     sg_draw(0, g_floor_mesh.num_indices, group.num_instances);
   }
 
+  // --- Draw Alien Collectables ---
+  auto draw_aliens = [&](Mesh &mesh, sg_buffer ibuf, int cnt) {
+    if (cnt <= 0 || mesh.num_indices <= 0 || ibuf.id == SG_INVALID_ID)
+      return;
+    sg_apply_pipeline(g_pip);
+    sg_bindings b = {};
+    b.vertex_buffers[0] = mesh.vbuf;
+    b.vertex_buffers[1] = ibuf;
+    b.index_buffer = mesh.ibuf;
+    // Default to white/dummy if alien has no texture loaded (it has missing png
+    // map)
+    b.views[0] = (mesh.diffuse_view.id != SG_INVALID_ID) ? mesh.diffuse_view
+                                                         : g_dummy_white_view;
+    b.views[1] = (mesh.normal_view.id != SG_INVALID_ID) ? mesh.normal_view
+                                                        : g_dummy_normal_view;
+    b.views[2] =
+        (mesh.orm_view.id != SG_INVALID_ID) ? mesh.orm_view : g_dummy_orm_view;
+    b.views[3] = (mesh.emissive_view.id != SG_INVALID_ID) ? mesh.emissive_view
+                                                          : g_dummy_black_view;
+    b.samplers[0].id = g_sampler.id;
+    sg_apply_bindings(&b);
+    sg_range vs = SG_RANGE(vs_params);
+    sg_apply_uniforms(0, &vs);
+    sg_range fs = SG_RANGE(fs_params);
+    sg_apply_uniforms(1, &fs);
+    sg_draw(0, mesh.num_indices, cnt);
+  };
+
+  draw_aliens(g_alien_cyclop_mesh, g_alien_cyclop_inst_buf, g_cyclop_count);
+  draw_aliens(g_alien_scolitex_mesh, g_alien_scolitex_inst_buf,
+              g_scolitex_count);
+  draw_aliens(g_alien_oculi_mesh, g_alien_oculi_inst_buf, g_oculi_count);
+
+  // --- Dibujar la puerta si está activa ---
+  if (g_stairs_active && g_door_mesh.num_indices > 0) {
+    sg_apply_pipeline(g_pip);
+    sg_bindings b = {};
+    b.vertex_buffers[0] = g_door_mesh.vbuf;
+    b.vertex_buffers[1] = g_door_inst_buf;
+    b.index_buffer = g_door_mesh.ibuf;
+    b.views[0] = (g_door_mesh.diffuse_view.id != SG_INVALID_ID)
+                     ? g_door_mesh.diffuse_view
+                     : g_dummy_white_view;
+    b.views[1] = (g_door_mesh.normal_view.id != SG_INVALID_ID)
+                     ? g_door_mesh.normal_view
+                     : g_dummy_normal_view;
+    b.views[2] = (g_door_mesh.orm_view.id != SG_INVALID_ID)
+                     ? g_door_mesh.orm_view
+                     : g_dummy_orm_view;
+    b.views[3] = (g_door_mesh.emissive_view.id != SG_INVALID_ID)
+                     ? g_door_mesh.emissive_view
+                     : g_dummy_black_view;
+    b.samplers[0].id = g_sampler.id;
+    sg_apply_bindings(&b);
+    sg_range vs = SG_RANGE(vs_params);
+    sg_apply_uniforms(0, &vs);
+    sg_range fs = SG_RANGE(fs_params);
+    sg_apply_uniforms(1, &fs);
+    sg_draw(0, g_door_mesh.num_indices, 1);
+  }
+
+  // --- Minimap 2D en la esquina inferior derecha (no dibujar si ganó) ---
+  if (!g_game_won) {
+    // Definir el rectángulo del minimapa en NDC ([-1,1] x [-1,1])
+    float margin = 0.05f;
+    float map_w = 0.35f;
+    float map_h = 0.35f;
+    float right = 1.0f - margin;
+    float bottom = -1.0f + margin;
+    float left = right - map_w;
+    float top = bottom + map_h;
+
+    float cell_w = map_w / (float)size;
+    float cell_h = map_h / (float)size;
+
+    MinimapVertex verts[MAX_MINIMAP_VERTS];
+    int vcount = 0;
+
+    // Dibujar celdas navegables como cuadriculas grises oscuras
+    for (int z = 0; z < size; z++) {
+      for (int x = 0; x < size; x++) {
+        if (matrix[z][x] == 0)
+          continue;
+
+        if (vcount + 6 > MAX_MINIMAP_VERTS)
+          break;
+
+        float x0 = left + x * cell_w;
+        float x1 = left + (x + 1) * cell_w;
+        float y0 = bottom + z * cell_h;
+        float y1 = bottom + (z + 1) * cell_h;
+
+        // Color gris oscuro semi-transparente
+        float r = 0.15f, g = 0.15f, b = 0.15f, a = 0.8f;
+
+        // Dos triángulos por celda
+        verts[vcount++] = {x0, y0, r, g, b, a};
+        verts[vcount++] = {x1, y0, r, g, b, a};
+        verts[vcount++] = {x1, y1, r, g, b, a};
+
+        verts[vcount++] = {x0, y0, r, g, b, a};
+        verts[vcount++] = {x1, y1, r, g, b, a};
+        verts[vcount++] = {x0, y1, r, g, b, a};
+      }
+    }
+
+    auto append_char = [&](char ch, float base_x, float base_y, float cw_txt,
+                           float ch_txt, float r, float g, float b, float a) {
+      // Fuente 3x5 muy simple en forma de matriz de bits.
+      // Cada fila es un entero con 3 bits significativos.
+      uint8_t rows[5] = {0, 0, 0, 0, 0};
+      switch (ch) {
+      case 'L':
+      case 'l':
+        rows[0] = 4;
+        rows[1] = 4;
+        rows[2] = 4;
+        rows[3] = 4;
+        rows[4] = 7;
+        break;
+      case 'o':
+      case 'O':
+        rows[0] = 2;
+        rows[1] = 5;
+        rows[2] = 5;
+        rows[3] = 5;
+        rows[4] = 2;
+        break;
+      case 'c':
+      case 'C':
+        rows[0] = 3;
+        rows[1] = 4;
+        rows[2] = 4;
+        rows[3] = 4;
+        rows[4] = 3;
+        break;
+      case 'a':
+      case 'A':
+        rows[0] = 2;
+        rows[1] = 5;
+        rows[2] = 7;
+        rows[3] = 5;
+        rows[4] = 5;
+        break;
+      case 'i':
+      case 'I':
+        rows[0] = 7;
+        rows[1] = 2;
+        rows[2] = 2;
+        rows[3] = 2;
+        rows[4] = 7;
+        break;
+      case 'z':
+      case 'Z':
+        rows[0] = 7;
+        rows[1] = 1;
+        rows[2] = 2;
+        rows[3] = 4;
+        rows[4] = 7;
+        break;
+      case 'd':
+      case 'D':
+        rows[0] = 3;
+        rows[1] = 5;
+        rows[2] = 5;
+        rows[3] = 5;
+        rows[4] = 3;
+        break;
+      case ':':
+        rows[0] = 0;
+        rows[1] = 2;
+        rows[2] = 0;
+        rows[3] = 2;
+        rows[4] = 0;
+        break;
+      case '[':
+        rows[0] = 3;
+        rows[1] = 2;
+        rows[2] = 2;
+        rows[3] = 2;
+        rows[4] = 3;
+        break;
+      case ']':
+        rows[0] = 6;
+        rows[1] = 2;
+        rows[2] = 2;
+        rows[3] = 2;
+        rows[4] = 6;
+        break;
+      case 's':
+      case 'S':
+        rows[0] = 3;
+        rows[1] = 4;
+        rows[2] = 2;
+        rows[3] = 1;
+        rows[4] = 6;
+        break;
+      case '-':
+        rows[0] = 0;
+        rows[1] = 0;
+        rows[2] = 7;
+        rows[3] = 0;
+        rows[4] = 0;
+        break;
+      case '0':
+        rows[0] = 7;
+        rows[1] = 5;
+        rows[2] = 5;
+        rows[3] = 5;
+        rows[4] = 7;
+        break;
+      case '1':
+        rows[0] = 2;
+        rows[1] = 6;
+        rows[2] = 2;
+        rows[3] = 2;
+        rows[4] = 7;
+        break;
+      case '2':
+        rows[0] = 7;
+        rows[1] = 1;
+        rows[2] = 7;
+        rows[3] = 4;
+        rows[4] = 7;
+        break;
+      case '3':
+        rows[0] = 7;
+        rows[1] = 1;
+        rows[2] = 7;
+        rows[3] = 1;
+        rows[4] = 7;
+        break;
+      case '4':
+        rows[0] = 5;
+        rows[1] = 5;
+        rows[2] = 7;
+        rows[3] = 1;
+        rows[4] = 1;
+        break;
+      case '5':
+        rows[0] = 7;
+        rows[1] = 4;
+        rows[2] = 7;
+        rows[3] = 1;
+        rows[4] = 7;
+        break;
+      case '6':
+        rows[0] = 7;
+        rows[1] = 4;
+        rows[2] = 7;
+        rows[3] = 5;
+        rows[4] = 7;
+        break;
+      case '7':
+        rows[0] = 7;
+        rows[1] = 1;
+        rows[2] = 2;
+        rows[3] = 2;
+        rows[4] = 2;
+        break;
+      case '8':
+        rows[0] = 7;
+        rows[1] = 5;
+        rows[2] = 7;
+        rows[3] = 5;
+        rows[4] = 7;
+        break;
+      case '9':
+        rows[0] = 7;
+        rows[1] = 5;
+        rows[2] = 7;
+        rows[3] = 1;
+        rows[4] = 7;
+        break;
+      case 'p':
+      case 'P':
+        rows[0] = 7;
+        rows[1] = 5;
+        rows[2] = 7;
+        rows[3] = 4;
+        rows[4] = 4;
+        break;
+      case 't':
+      case 'T':
+        rows[0] = 7;
+        rows[1] = 2;
+        rows[2] = 2;
+        rows[3] = 2;
+        rows[4] = 2;
+        break;
+      case 'u':
+      case 'U':
+        rows[0] = 5;
+        rows[1] = 5;
+        rows[2] = 5;
+        rows[3] = 5;
+        rows[4] = 7;
+        break;
+      case 'R':
+      case 'r':
+        rows[0] = 7;
+        rows[1] = 5;
+        rows[2] = 7;
+        rows[3] = 6;
+        rows[4] = 5;
+        break;
+      case 'N':
+      case 'n':
+        rows[0] = 5;
+        rows[1] = 7;
+        rows[2] = 5;
+        rows[3] = 5;
+        rows[4] = 5;
+        break;
+      case 'F':
+      case 'f':
+        rows[0] = 7;
+        rows[1] = 4;
+        rows[2] = 6;
+        rows[3] = 4;
+        rows[4] = 4;
+        break;
+      case 'E':
+      case 'e':
+        rows[0] = 7;
+        rows[1] = 4;
+        rows[2] = 7;
+        rows[3] = 4;
+        rows[4] = 7;
+        break;
+      case ' ':
+      default:
+        break; // space or unknown
+      }
+
+      for (int r_idx = 0; r_idx < 5; r_idx++) {
+        for (int c_idx = 0; c_idx < 3; c_idx++) {
+          if (rows[r_idx] & (1 << (2 - c_idx))) {
+            if (vcount + 6 > MAX_MINIMAP_VERTS)
+              return;
+
+            float px0 = base_x + c_idx * cw_txt;
+            float px1 = px0 + cw_txt;
+            float py1 = base_y - r_idx * ch_txt; // Dibuja hacia abajo
+            float py0 = py1 - ch_txt;
+
+            verts[vcount++] = {px0, py0, r, g, b, a};
+            verts[vcount++] = {px1, py0, r, g, b, a};
+            verts[vcount++] = {px1, py1, r, g, b, a};
+
+            verts[vcount++] = {px0, py0, r, g, b, a};
+            verts[vcount++] = {px1, py1, r, g, b, a};
+            verts[vcount++] = {px0, py1, r, g, b, a};
+          }
+        }
+      }
+    };
+
+    float window_w = (float)sapp_width();
+    float window_h = (float)sapp_height();
+
+    // Reducimos el tamaño global de las fuentes un 20% (multiplicando por 0.8)
+    float text_scale_x = 0.05f * 0.80f;
+    float text_scale_y = (window_w / (float)window_h) * 0.05f * 0.80f;
+    float cw_txt = text_scale_x / 4.0f;
+    float ch_txt = text_scale_y / 6.0f;
+
+    // Dibujar UI contador de Aliens (Top-Left)
+    std::string alien_label;
+    if (g_collected_count >= g_total_aliens) {
+      alien_label = "TODOS LOS ALIENS FUERON CAPTURADOS";
+    } else {
+      alien_label = "ALIENS CAPTURADOS: " + std::to_string(g_collected_count) +
+                    " DE " + std::to_string(g_total_aliens);
+    }
+    float ui_x = -0.95f;
+    float ui_y = 0.90f;
+    for (char c : alien_label) {
+      append_char(c, ui_x, ui_y, cw_txt, ch_txt, 0.2f, 1.0f, 0.5f,
+                  1.0f); // Verde acentuado
+      ui_x += cw_txt * 4.0f;
+    }
+
+    // Marcar posición del jugador en verde
+    if (current_z >= 0 && current_z < size && current_x >= 0 &&
+        current_x < size) {
+      if (vcount + 6 <= MAX_MINIMAP_VERTS) {
+        float px0 = left + current_x * cell_w + cell_w * 0.15f;
+        float px1 = left + (current_x + 1) * cell_w - cell_w * 0.15f;
+        float py0 = bottom + current_z * cell_h + cell_h * 0.15f;
+        float py1 = bottom + (current_z + 1) * cell_h - cell_h * 0.15f;
+
+        float r = 0.0f, g = 0.9f, b = 0.2f, a = 1.0f;
+
+        verts[vcount++] = {px0, py0, r, g, b, a};
+        verts[vcount++] = {px1, py0, r, g, b, a};
+        verts[vcount++] = {px1, py1, r, g, b, a};
+
+        verts[vcount++] = {px0, py0, r, g, b, a};
+        verts[vcount++] = {px1, py1, r, g, b, a};
+        verts[vcount++] = {px0, py1, r, g, b, a};
+      }
+    }
+
+    if (vcount > 0) {
+      sg_apply_pipeline(g_minimap_pip);
+      sg_bindings mm_binds = {};
+      mm_binds.vertex_buffers[0] = g_minimap_vbuf;
+      sg_apply_bindings(&mm_binds);
+
+      sg_range mm_range = {verts, (size_t)(vcount * sizeof(MinimapVertex))};
+      sg_update_buffer(g_minimap_vbuf, &mm_range);
+
+      sg_draw(0, vcount, 1);
+    }
+  }
+  // --- Fade Overlay (pantalla negra con alpha para transición) ---
+  if (g_fade_state != FADE_NONE || g_game_won) {
+    MinimapVertex fade_verts[6];
+    float a = g_game_won ? 1.0f : g_fade_alpha;
+    // Triángulo 1
+    fade_verts[0] = {-1.0f, -1.0f, 0, 0, 0, a};
+    fade_verts[1] = {1.0f, -1.0f, 0, 0, 0, a};
+    fade_verts[2] = {1.0f, 1.0f, 0, 0, 0, a};
+    // Triángulo 2
+    fade_verts[3] = {-1.0f, -1.0f, 0, 0, 0, a};
+    fade_verts[4] = {1.0f, 1.0f, 0, 0, 0, a};
+    fade_verts[5] = {-1.0f, 1.0f, 0, 0, 0, a};
+
+    sg_apply_pipeline(g_minimap_pip);
+    sg_bindings fade_binds = {};
+    fade_binds.vertex_buffers[0] = g_fade_vbuf;
+    sg_apply_bindings(&fade_binds);
+
+    sg_range fade_range = {fade_verts, sizeof(fade_verts)};
+    sg_update_buffer(g_fade_vbuf, &fade_range);
+    sg_draw(0, 6, 1);
+  }
+
+  // --- Pantalla de Victoria ---
+  if (g_game_won) {
+    float window_w = (float)sapp_width();
+    float window_h = (float)sapp_height();
+    float text_scale_x = 0.04f;
+    float text_scale_y = (window_w / window_h) * 0.04f;
+    float cw_txt = text_scale_x / 4.0f;
+    float ch_txt = text_scale_y / 6.0f;
+    int vcount_win = 0;
+    MinimapVertex win_verts[MAX_MINIMAP_VERTS];
+
+    auto append_win_char = [&](char ch, float base_x, float base_y, float cw_c,
+                               float ch_c, float r, float g, float b,
+                               float aa) {
+      uint8_t rows[5] = {0, 0, 0, 0, 0};
+      switch (ch) {
+      case 'A':
+        rows[0] = 0b010;
+        rows[1] = 0b101;
+        rows[2] = 0b111;
+        rows[3] = 0b101;
+        rows[4] = 0b101;
+        break;
+      case 'B':
+        rows[0] = 0b110;
+        rows[1] = 0b101;
+        rows[2] = 0b110;
+        rows[3] = 0b101;
+        rows[4] = 0b110;
+        break;
+      case 'C':
+        rows[0] = 0b111;
+        rows[1] = 0b100;
+        rows[2] = 0b100;
+        rows[3] = 0b100;
+        rows[4] = 0b111;
+        break;
+      case 'D':
+        rows[0] = 0b110;
+        rows[1] = 0b101;
+        rows[2] = 0b101;
+        rows[3] = 0b101;
+        rows[4] = 0b110;
+        break;
+      case 'E':
+        rows[0] = 0b111;
+        rows[1] = 0b100;
+        rows[2] = 0b110;
+        rows[3] = 0b100;
+        rows[4] = 0b111;
+        break;
+      case 'G':
+        rows[0] = 0b111;
+        rows[1] = 0b100;
+        rows[2] = 0b101;
+        rows[3] = 0b101;
+        rows[4] = 0b111;
+        break;
+      case 'H':
+        rows[0] = 0b101;
+        rows[1] = 0b101;
+        rows[2] = 0b111;
+        rows[3] = 0b101;
+        rows[4] = 0b101;
+        break;
+      case 'I':
+        rows[0] = 0b111;
+        rows[1] = 0b010;
+        rows[2] = 0b010;
+        rows[3] = 0b010;
+        rows[4] = 0b111;
+        break;
+      case 'J':
+        rows[0] = 0b001;
+        rows[1] = 0b001;
+        rows[2] = 0b001;
+        rows[3] = 0b101;
+        rows[4] = 0b010;
+        break;
+      case 'L':
+        rows[0] = 0b100;
+        rows[1] = 0b100;
+        rows[2] = 0b100;
+        rows[3] = 0b100;
+        rows[4] = 0b111;
+        break;
+      case 'N':
+        rows[0] = 0b101;
+        rows[1] = 0b111;
+        rows[2] = 0b111;
+        rows[3] = 0b101;
+        rows[4] = 0b101;
+        break;
+      case 'O':
+        rows[0] = 0b010;
+        rows[1] = 0b101;
+        rows[2] = 0b101;
+        rows[3] = 0b101;
+        rows[4] = 0b010;
+        break;
+      case 'P':
+        rows[0] = 0b110;
+        rows[1] = 0b101;
+        rows[2] = 0b110;
+        rows[3] = 0b100;
+        rows[4] = 0b100;
+        break;
+      case 'R':
+        rows[0] = 0b110;
+        rows[1] = 0b101;
+        rows[2] = 0b110;
+        rows[3] = 0b101;
+        rows[4] = 0b101;
+        break;
+      case 'S':
+        rows[0] = 0b011;
+        rows[1] = 0b100;
+        rows[2] = 0b010;
+        rows[3] = 0b001;
+        rows[4] = 0b110;
+        break;
+      case 'U':
+        rows[0] = 0b101;
+        rows[1] = 0b101;
+        rows[2] = 0b101;
+        rows[3] = 0b101;
+        rows[4] = 0b111;
+        break;
+      case ',':
+        rows[3] = 0b010;
+        rows[4] = 0b100;
+        break;
+      case ' ':
+        break;
+      default:
+        rows[0] = 0b111;
+        rows[1] = 0b111;
+        rows[2] = 0b111;
+        rows[3] = 0b111;
+        rows[4] = 0b111;
+        break;
+      }
+      for (int row = 0; row < 5; row++) {
+        for (int col = 0; col < 3; col++) {
+          if (rows[row] & (1 << (2 - col))) {
+            float x0 = base_x + col * cw_c;
+            float y0 = base_y - row * ch_c;
+            float x1 = x0 + cw_c;
+            float y1 = y0 - ch_c;
+            if (vcount_win + 6 <= MAX_MINIMAP_VERTS) {
+              win_verts[vcount_win++] = {x0, y0, r, g, b, aa};
+              win_verts[vcount_win++] = {x1, y0, r, g, b, aa};
+              win_verts[vcount_win++] = {x1, y1, r, g, b, aa};
+              win_verts[vcount_win++] = {x0, y0, r, g, b, aa};
+              win_verts[vcount_win++] = {x1, y1, r, g, b, aa};
+              win_verts[vcount_win++] = {x0, y1, r, g, b, aa};
+            }
+          }
+        }
+      }
+    };
+
+    // Linea 1:  HAS GANADO
+    std::string line1 = "HAS GANADO";
+    float line1_w = line1.size() * 4 * cw_txt;
+    float x1_start = -line1_w / 2.0f;
+    float y1_start = 0.3f;
+    for (size_t i = 0; i < line1.size(); i++) {
+      append_win_char(line1[i], x1_start + i * 4 * cw_txt, y1_start, cw_txt,
+                      ch_txt, 0.2f, 1.0f, 0.4f, 1.0f);
+    }
+
+    // Linea 2:  PRESIONA ESPACIO
+    std::string line2 = "PRESIONA ESPACIO";
+    float line2_w = line2.size() * 4 * cw_txt;
+    float x2_start = -line2_w / 2.0f;
+    float y2_start = 0.0f;
+    for (size_t i = 0; i < line2.size(); i++) {
+      append_win_char(line2[i], x2_start + i * 4 * cw_txt, y2_start, cw_txt,
+                      ch_txt, 1.0f, 1.0f, 1.0f, 1.0f);
+    }
+
+    // Linea 3:  PARA REINICIAR
+    std::string line3 = "PARA REINICIAR";
+    float line3_w = line3.size() * 4 * cw_txt;
+    float x3_start = -line3_w / 2.0f;
+    float y3_start = -0.2f;
+    for (size_t i = 0; i < line3.size(); i++) {
+      append_win_char(line3[i], x3_start + i * 4 * cw_txt, y3_start, cw_txt,
+                      ch_txt, 1.0f, 1.0f, 1.0f, 1.0f);
+    }
+
+    // Linea 4:  O ESC PARA SALIR
+    std::string line4 = "O ESC PARA SALIR";
+    float line4_w = line4.size() * 4 * cw_txt;
+    float x4_start = -line4_w / 2.0f;
+    float y4_start = -0.4f;
+    for (size_t i = 0; i < line4.size(); i++) {
+      append_win_char(line4[i], x4_start + i * 4 * cw_txt, y4_start, cw_txt,
+                      ch_txt, 0.7f, 0.7f, 0.7f, 1.0f);
+    }
+
+    if (vcount_win > 0) {
+      sg_apply_pipeline(g_minimap_pip);
+      sg_bindings win_binds = {};
+      win_binds.vertex_buffers[0] = g_minimap_vbuf;
+      sg_apply_bindings(&win_binds);
+      sg_range win_range = {win_verts,
+                            (size_t)(vcount_win * sizeof(MinimapVertex))};
+      sg_update_buffer(g_minimap_vbuf, &win_range);
+      sg_draw(0, vcount_win, 1);
+    }
+  }
+
   sg_end_pass();
   sg_commit();
 }
@@ -554,6 +1815,10 @@ static void frame_cb(void) {
 static void cleanup_cb(void) {
   g_wall_mesh.destroy();
   g_floor_mesh.destroy();
+  g_alien_cyclop_mesh.destroy();
+  g_alien_scolitex_mesh.destroy();
+  g_alien_oculi_mesh.destroy();
+  g_door_mesh.destroy(); // Destroy door mesh
 
   // Limpiar grupos de suelo
   for (auto &it : g_floor_groups) {
@@ -561,8 +1826,18 @@ static void cleanup_cb(void) {
   }
   g_floor_groups.clear();
 
+  if (g_alien_cyclop_inst_buf.id != SG_INVALID_ID)
+    sg_destroy_buffer(g_alien_cyclop_inst_buf);
+  if (g_alien_scolitex_inst_buf.id != SG_INVALID_ID)
+    sg_destroy_buffer(g_alien_scolitex_inst_buf);
+  if (g_alien_oculi_inst_buf.id != SG_INVALID_ID)
+    sg_destroy_buffer(g_alien_oculi_inst_buf);
+
   sg_destroy_buffer(g_inst_buf);
   sg_destroy_pipeline(g_pip);
+  sg_destroy_buffer(g_minimap_vbuf);
+  sg_destroy_pipeline(g_minimap_pip);
+  sg_destroy_shader(g_minimap_shader);
   sg_destroy_sampler(g_sampler);
   sg_destroy_image(g_dummy_white_img);
   sg_destroy_image(g_dummy_black_img);
@@ -577,6 +1852,10 @@ static void event_cb(const sapp_event *ev) {
   if (ev->type == SAPP_EVENTTYPE_KEY_DOWN) {
     if (ev->key_code == SAPP_KEYCODE_ESCAPE) {
       sapp_request_quit();
+    }
+    // Reiniciar juego desde la pantalla de victoria
+    if (ev->key_code == SAPP_KEYCODE_SPACE && g_game_won) {
+      g_restart_pending = true; // Diferir al frame_cb
     }
     if (ev->key_code < 512) {
       g_input.keys[ev->key_code] = true;
