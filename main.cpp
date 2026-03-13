@@ -2,7 +2,7 @@
 
 int main() {
   GameConfig config;
-  int base_size = 10;
+  int base_size = 20;
 
   // Crear los 3 niveles
   create_levels(config.levels, base_size);

@@ -427,22 +427,15 @@ static void build_level_geometry(int lvl) {
     float cz = (c.x + 0.5f) * cw;
     HMM_Vec3 alien_pos = HMM_V3(cx, 0.0f, cz);
 
-    // Check de colisión por AABB (Axis-Aligned Bounding Box)
-    // Asumimos un radio/ancho y profundidad aproximado para el alien escalado
-    // (ej: 0.8 unids)
-    float aabb_hx = 0.8f;
-    float aabb_hz = 0.8f;
-    // Y la cámara representa al jugador con cierto grosor (ej: 0.3 unids)
-    float cam_hx = 0.3f;
-    float cam_hz = 0.3f;
+    // Check de colisión por Círculo-Círculo especificado en la rúbrica
+    float alien_radius = 0.8f;
+    float player_radius = 0.3f;
 
-    // Verificamos solapamiento en el eje X y Z
-    bool overlap_x = (g_camera.position.X + cam_hx >= alien_pos.X - aabb_hx) &&
-                     (g_camera.position.X - cam_hx <= alien_pos.X + aabb_hx);
-    bool overlap_z = (g_camera.position.Z + cam_hz >= alien_pos.Z - aabb_hz) &&
-                     (g_camera.position.Z - cam_hz <= alien_pos.Z + aabb_hz);
+    HMM_Vec2 d_vec = HMM_SubV2(HMM_V2(g_camera.position.X, g_camera.position.Z),
+                               HMM_V2(alien_pos.X, alien_pos.Z));
+    float dist = HMM_LenV2(d_vec);
 
-    if (overlap_x && overlap_z) {
+    if (dist < (alien_radius + player_radius)) {
       c.texture_id = -1; // Marcar como recolectado
       g_collected_count++;
       continue;
@@ -513,7 +506,7 @@ static void init_cb(void) {
   g_dummy_orm_view = orm.second;
 
   // Generar niveles y colectables
-  int base_size = 10;
+  int base_size = 20;
   create_levels(g_config.levels, base_size);
 
   for (int i = 0; i < 3; i++) {
@@ -879,19 +872,15 @@ static void frame_cb(void) {
       float cz = (c.x + 0.5f) * cw_3d;
       HMM_Vec3 alien_pos = HMM_V3(cx, 0.0f, cz);
 
-      // Check AABB
-      float aabb_hx = 0.8f;
-      float aabb_hz = 0.8f;
-      float cam_hx = 0.3f;
-      float cam_hz = 0.3f;
-      bool overlap_x =
-          (g_camera.position.X + cam_hx >= alien_pos.X - aabb_hx) &&
-          (g_camera.position.X - cam_hx <= alien_pos.X + aabb_hx);
-      bool overlap_z =
-          (g_camera.position.Z + cam_hz >= alien_pos.Z - aabb_hz) &&
-          (g_camera.position.Z - cam_hz <= alien_pos.Z + aabb_hz);
+      // Check Círculo-Círculo
+      float alien_radius = 0.8f;
+      float player_radius = 0.3f;
+      HMM_Vec2 d_vec =
+          HMM_SubV2(HMM_V2(g_camera.position.X, g_camera.position.Z),
+                    HMM_V2(alien_pos.X, alien_pos.Z));
+      float dist = HMM_LenV2(d_vec);
 
-      if (overlap_x && overlap_z) {
+      if (dist < (alien_radius + player_radius)) {
         c.texture_id = -1; // Marcar como recolectado
         g_collected_count++;
 

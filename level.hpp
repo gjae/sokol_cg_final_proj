@@ -37,11 +37,10 @@ struct Level {
   }
 };
 
-// Genera los 3 niveles con tamaño duplicándose
-// Nivel 1: base_size, Nivel 2: base_size*2, Nivel 3: base_size*4
+// Genera los 3 niveles con tamaños progresivos: 20x20, 40x40, 60x60
 inline void create_levels(Level levels[3], int base_size) {
   for (int i = 0; i < 3; i++) {
-    int size = base_size * (1 << i);
+    int size = base_size * (i + 1);
     levels[i].init(i + 1, size);
   }
 
