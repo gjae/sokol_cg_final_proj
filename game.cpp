@@ -936,6 +936,9 @@ static void frame_cb(void) {
             printf("=== PUERTA GENERADA en celda [%d][%d], posición 3D (%.1f, "
                    "%.1f) ===\n",
                    best_z, best_x, g_stairs_pos.X, g_stairs_pos.Z);
+
+            return; // Exit frame to prevent double buffer updates from
+                    // build_level_geometry and the main update below
           } else {
             printf("!!! ERROR: No se encontró muro adyacente a zona navegable "
                    "!!!\n");
@@ -1027,6 +1030,8 @@ static void frame_cb(void) {
           g_camera.update_vectors();
 
           g_fade_state = FADE_IN;
+          return; // Prevents updating buffers twice in the same frame when
+                  // transitioning levels
         }
       }
     } else if (g_fade_state == FADE_IN) {
