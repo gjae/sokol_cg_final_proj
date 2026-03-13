@@ -28,6 +28,7 @@ struct InputState {
 };
 static InputState g_input = {};
 static bool g_show_minimap_aliens = false; // Flag for toggling minimap aliens
+static bool g_level_transition_pending = false; // Flag to defer level load
 static HMM_Mat4 view_mat;
 static HMM_Mat4 proj_mat;
 
@@ -777,6 +778,39 @@ static void frame_cb(void) {
             // only one update allowed per buffer and frame)
   }
 
+  // --- Manejar avance al siguiente nivel (diferido desde la transición fade
+  // out) ---
+  if (g_level_transition_pending) {
+    g_level_transition_pending = false;
+
+    // El 'g_config.current_level' ya fue incrementado en la maquina de estados
+    // de Fade
+    int lvl_r = g_config.current_level;
+    g_stairs_active = false;
+    g_total_aliens = g_config.collectable_count[lvl_r];
+    g_collected_count = 0;
+    g_door_needs_update = false;
+
+    build_level_geometry(lvl_r);
+
+    float cw = 4.0f;
+    int start_room_idx = rand() % g_config.levels[lvl_r].map->room_count;
+    Room start_room = g_config.levels[lvl_r].map->rooms[start_room_idx];
+    g_camera.position =
+        HMM_V3(-start_room.center_y() * cw, 1.0f, start_room.center_x() * cw);
+    g_camera.yaw = 180.0f;
+    g_camera.update_vectors();
+    sapp_lock_mouse(true);
+
+    return; // Evitar choques de buffer
+  }
+
+  // --- Manejar regeneración de nivel diferida (ej: al aparecer la puerta) ---
+  if (g_door_needs_update) {
+    g_door_needs_update = false;
+    build_level_geometry(g_config.current_level);
+  }
+
   // Movimiento de jugador: solo si no hay fade transition
   if (g_fade_state == FADE_NONE) {
     float speed = 20.0f * dt;
@@ -933,12 +967,14 @@ static void frame_cb(void) {
                 HMM_V3(-(best_z + 0.5f) * cw_3d, 0.0f, (best_x + 0.5f) * cw_3d);
             build_level_geometry(lvl); // Reconstruir sin ese muro
 
+            // ...
             printf("=== PUERTA GENERADA en celda [%d][%d], posición 3D (%.1f, "
                    "%.1f) ===\n",
                    best_z, best_x, g_stairs_pos.X, g_stairs_pos.Z);
 
-            return; // Exit frame to prevent double buffer updates from
-                    // build_level_geometry and the main update below
+            g_door_needs_update =
+                true; // Activar el flag para diferir la construcción de
+                      // geometría al próximo frame
           } else {
             printf("!!! ERROR: No se encontró muro adyacente a zona navegable "
                    "!!!\n");
@@ -961,18 +997,25 @@ static void frame_cb(void) {
         oculi_inst.push_back(tf);
     }
 
-    auto update_dynamic_buf = [](sg_buffer buf,
-                                 const std::vector<HMM_Mat4> &inst) {
-      if (!inst.empty()) {
-        sg_update_buffer(buf, {inst.data(), inst.size() * sizeof(HMM_Mat4)});
-      }
-    };
-    g_cyclop_count = cyclop_inst.size();
-    g_scolitex_count = scolitex_inst.size();
-    g_oculi_count = oculi_inst.size();
-    update_dynamic_buf(g_alien_cyclop_inst_buf, cyclop_inst);
-    update_dynamic_buf(g_alien_scolitex_inst_buf, scolitex_inst);
-    update_dynamic_buf(g_alien_oculi_inst_buf, oculi_inst);
+    // ACTUALIZACION CONDICIONAL PARA EVITAR CONFLICTOS CON
+    // "build_level_geometry" Solo actualiza los buffers dinámicos aquí si NO se
+    // regeneró la puerta en este frame. La puerta usa 'g_door_needs_update'
+    // como señal de que la topología cambió y debe reconstruirse todo en el
+    // próximo frame.
+    if (!g_door_needs_update) {
+      auto update_dynamic_buf = [](sg_buffer buf,
+                                   const std::vector<HMM_Mat4> &inst) {
+        if (!inst.empty()) {
+          sg_update_buffer(buf, {inst.data(), inst.size() * sizeof(HMM_Mat4)});
+        }
+      };
+      g_cyclop_count = cyclop_inst.size();
+      g_scolitex_count = scolitex_inst.size();
+      g_oculi_count = oculi_inst.size();
+      update_dynamic_buf(g_alien_cyclop_inst_buf, cyclop_inst);
+      update_dynamic_buf(g_alien_scolitex_inst_buf, scolitex_inst);
+      update_dynamic_buf(g_alien_oculi_inst_buf, oculi_inst);
+    }
 
     // Colision con la puerta — disparar fade al tocar el area de la puerta
     if (g_stairs_active && g_fade_state == FADE_NONE) {
@@ -1014,24 +1057,11 @@ static void frame_cb(void) {
               false); // Liberar el cursor para la pantalla de victoria
         } else {
           // Pantalla completamente negra → cambiar de nivel
+          // Diferimos la transición usando el mecanismo específico para avance
+          // de nivel
+          g_level_transition_pending = true;
           g_config.current_level = next_level;
-          lvl = g_config.current_level;
-          g_stairs_active = false;
-          g_total_aliens = g_config.collectable_count[lvl];
-          g_collected_count = 0;
-
-          build_level_geometry(lvl);
-
-          int start_room_idx = rand() % g_config.levels[lvl].map->room_count;
-          Room start_room = g_config.levels[lvl].map->rooms[start_room_idx];
-          g_camera.position = HMM_V3(-start_room.center_y() * cw_3d, 1.0f,
-                                     start_room.center_x() * cw_3d);
-          g_camera.yaw = 180.0f;
-          g_camera.update_vectors();
-
           g_fade_state = FADE_IN;
-          return; // Prevents updating buffers twice in the same frame when
-                  // transitioning levels
         }
       }
     } else if (g_fade_state == FADE_IN) {
@@ -1042,12 +1072,6 @@ static void frame_cb(void) {
       }
     }
   } // end if (!g_game_won)
-
-  // Actualizar buffer de puerta si es necesario
-  if (g_door_needs_update) {
-    g_door_needs_update = false;
-    sg_update_buffer(g_door_inst_buf, {&g_door_transform, sizeof(HMM_Mat4)});
-  }
 
   // Generar las matrices MVP (View y Projection)
   HMM_Mat4 view = g_camera.get_view_matrix();
