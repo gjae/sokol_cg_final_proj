@@ -749,6 +749,20 @@ static void frame_cb(void) {
     g_fade_alpha = 0.0f;
     g_door_needs_update = false;
 
+    // Limpiar marcadores de puerta (99) de todos los mapas para que no
+    // aparezcan abiertas al reiniciar
+    for (int l = 0; l < 3; l++) {
+      int **m = g_config.levels[l].map->get_matrix();
+      int s = g_config.levels[l].map->get_size();
+      for (int z = 0; z < s; z++) {
+        for (int x = 0; x < s; x++) {
+          if (m[z][x] == 99) {
+            m[z][x] = 0;
+          }
+        }
+      }
+    }
+
     for (int l = 0; l < 3; l++) {
       for (int i = 0; i < g_config.collectable_count[l]; i++) {
         g_config.collectables[l][i].texture_id = 100 + (i % 3);
