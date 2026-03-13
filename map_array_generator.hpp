@@ -77,7 +77,9 @@ protected:
   static const int ROOM_MIN_SIZE = 3;
   static const int ROOM_MAX_SIZE = 5;
   static const int MAX_ROOM_ATTEMPTS =
-      50; // Aumentado para incluir pasillos como áreas
+      50; // Intentos de generar salas principales
+  static const int MAX_ROOMS =
+      MAX_ROOM_ATTEMPTS * 3; // Capacidad total incluyendo pasillos
 
   int rand_range(int min, int max) { return min + (rand() % (max - min + 1)); }
 
@@ -119,7 +121,7 @@ protected:
     int start = (x1 < x2) ? x1 : x2;
     int end = (x1 < x2) ? x2 : x1;
 
-    if (room_count < MAX_ROOM_ATTEMPTS) {
+    if (room_count < MAX_ROOMS) {
       rooms[room_count] = {start, y, end - start + 1, 1, 6, texture};
       room_count++;
     }
@@ -137,7 +139,7 @@ protected:
     int start = (y1 < y2) ? y1 : y2;
     int end = (y1 < y2) ? y2 : y1;
 
-    if (room_count < MAX_ROOM_ATTEMPTS) {
+    if (room_count < MAX_ROOMS) {
       rooms[room_count] = {x, start, 1, end - start + 1, 6, texture};
       room_count++;
     }
@@ -159,10 +161,15 @@ protected:
   }
 
   void generate_map() {
-    rooms = new Room[MAX_ROOM_ATTEMPTS];
+    rooms = new Room[MAX_ROOMS];
     room_count = 0;
 
     for (int attempt = 0; attempt < MAX_ROOM_ATTEMPTS; attempt++) {
+      if (room_count >= MAX_ROOMS - 3) {
+        // Evita exceder búfer al añadir la sala + pasillos
+        break;
+      }
+
       int w = rand_range(ROOM_MIN_SIZE, ROOM_MAX_SIZE);
       int h = rand_range(ROOM_MIN_SIZE, ROOM_MAX_SIZE);
 
@@ -219,8 +226,10 @@ protected:
         carve_vertical_corridor(prev_cy, new_cy, new_cx, new_room.texture);
       }
 
-      rooms[room_count] = new_room;
-      room_count++;
+      if (room_count < MAX_ROOMS) {
+        rooms[room_count] = new_room;
+        room_count++;
+      }
     }
 
     // Sincronizar el array 1D con la matriz generada
