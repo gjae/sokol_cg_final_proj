@@ -1558,6 +1558,35 @@ static void frame_cb(void) {
       }
     }
 
+    // Dibujar puntos rojos para los aliens no recolectados si se presiona la
+    // tecla M
+    if (g_input.keys[SAPP_KEYCODE_M]) {
+      int lvl_map = g_config.current_level;
+      for (int i = 0; i < g_total_aliens; i++) {
+        Collectable &c = g_config.collectables[lvl_map][i];
+        if (c.texture_id == -1) // Ignorar los ya recolectados
+          continue;
+
+        if (vcount + 6 <= MAX_MINIMAP_VERTS) {
+          // El alien está en c.y (fila/z) y c.x (columna/x)
+          float px0 = left + c.x * cell_w + cell_w * 0.3f;
+          float px1 = left + (c.x + 1) * cell_w - cell_w * 0.3f;
+          float py0 = bottom + c.y * cell_h + cell_h * 0.3f;
+          float py1 = bottom + (c.y + 1) * cell_h - cell_h * 0.3f;
+
+          float r = 1.0f, g = 0.0f, b = 0.0f, a = 1.0f; // Rojo puro
+
+          verts[vcount++] = {px0, py0, r, g, b, a};
+          verts[vcount++] = {px1, py0, r, g, b, a};
+          verts[vcount++] = {px1, py1, r, g, b, a};
+
+          verts[vcount++] = {px0, py0, r, g, b, a};
+          verts[vcount++] = {px1, py1, r, g, b, a};
+          verts[vcount++] = {px0, py1, r, g, b, a};
+        }
+      }
+    }
+
     if (vcount > 0) {
       sg_apply_pipeline(g_minimap_pip);
       sg_bindings mm_binds = {};
