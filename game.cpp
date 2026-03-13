@@ -772,6 +772,9 @@ static void frame_cb(void) {
     g_camera.yaw = 180.0f;
     g_camera.update_vectors();
     sapp_lock_mouse(true);
+
+    return; // Evita actualizar los buffers otra vez este frame (Sokol error:
+            // only one update allowed per buffer and frame)
   }
 
   // Movimiento de jugador: solo si no hay fade transition
